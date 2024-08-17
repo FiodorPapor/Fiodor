@@ -53,3 +53,4 @@ web3==6.20.2
 websockets==12.0
 Werkzeug==3.0.3
 yarl==1.9.4
+gunicorn==20.1.0
