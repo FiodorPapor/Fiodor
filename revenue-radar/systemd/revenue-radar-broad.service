@@ -1,0 +1,16 @@
+[Unit]
+Description=Revenue Radar Broad Commercial Detector
+After=network-online.target intent-radar.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/intent-radar
+EnvironmentFile=/opt/intent-radar/radar-alert.env
+ExecStart=/usr/bin/python3 /opt/intent-radar/broad_radar.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
