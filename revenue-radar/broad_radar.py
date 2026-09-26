@@ -22,7 +22,8 @@ ARG_GEO = (
 )
 PROPERTY = (
     "квартир", "жиль", "студи", "апартамент", "недвиж", "дом ", "дом,", "дом.",
-    "departamento", "depto", "dpto", "propiedad", "inmueble", "monoambiente", "ambiente"
+    "departamento", "depto", "dpto", "propiedad", "inmueble", "monoambiente", "ambiente",
+    "объект недвиж", "земел", "участ", "terreno", "lote", "local comercial", "oficina", "cochera", "campo"
 )
 NEED = (
     "ищу", "ищем", "нужен", "нужна", "нужно", "хочу", "хотим", "планирую", "планируем",
@@ -32,15 +33,17 @@ NEED = (
 BUY = (
     "купить квартир", "купить недвиж", "купить дом", "покупка недвиж", "покупку недвиж",
     "покупать недвиж", "приобрести недвиж", "comprar departamento", "comprar propiedad",
-    "comprar casa", "buy apartment", "buy property"
+    "comprar casa", "quiero comprar", "queremos comprar", "busco comprar",
+    "хочу купить", "хотим купить", "планирую купить", "планируем купить",
+    "buy apartment", "buy property"
 )
 RENT = (
-    "снять квартир", "снять жиль", "арендовать квартир", "арендовать жиль", "ищу квартир",
+    "снять квартир", "снять жиль", "сниму ", "сниму квартир", "сниму жиль", "сниму дом", "арендовать квартир", "арендовать жиль", "ищу квартир",
     "ищем квартир", "ищу жиль", "ищем жиль", "ищу студ", "ищем студ", "alquilar",
     "alquiler", "busco departamento", "busco depto", "rentar"
 )
 INVEST = (
-    "инвестир", "куда влож", "во что влож", "капитал", "доходност", "рентабельност",
+    "инвестир", "инвестиц", "инвестицион", "куда влож", "во что влож", "капитал", "доходност", "рентабельност",
     "сохранить деньги", "сохранить капитал", "rentabilidad", "rendimiento", "invertir",
     "inversión", "inversion", "investment", "пассивный доход"
 )
@@ -50,12 +53,25 @@ PREINTENT = (
     "hipoteca", "apto crédito", "apto credito", "комисси", "расходы при покуп",
     "налог при покуп", "налоги при покуп", "bienes personales", "expensas",
     "перевести деньги", "завести деньги", "перевод денег", "перевод средств",
-    "деньги из россии", "деньги в аргентин", "usdt", "крипт", "crypto"
+    "деньги из россии", "деньги в аргентин", "продажа квартиры в россии",
+    "какой район", "какие районы", "где лучше жить", "что выбрать палермо",
+    "gastos de compra", "gastos escritura", "honorarios escribano",
+    "comisión inmobiliaria", "comision inmobiliaria", "impuestos compra",
+    "impuesto inmobiliario", "comprar siendo extranjero", "extranjero comprar",
+    "transferir fondos", "transferencia internacional", "origen fondos",
+    "qué barrio", "que barrio", "zonas para vivir", "barrio para vivir",
+    "residencia por inversión", "residencia por inversion", "ciudadanía por inversión",
+    "ciudadania por inversion", "внж через покуп", "гражданство через инвест",
+    "бизнес план", "бизнес-план", "business plan", "plan de negocio", "сумма инвестиц",
+    "reserva de compra", "seña", "sena", "informe de dominio", "escribanía", "escribania",
+    "tasación", "tasacion", "título de propiedad", "titulo de propiedad"
 )
 RENT_FRICTION = (
     "без подтверждения доход", "иностранный доход", "неофициальный доход", "garantía",
     "garantia", "seguro de caución", "seguro de caucion", "без гаранти", "гарантия для арен",
-    "не могу снять", "не получается снять", "recibo de sueldo", "нет recibo de sueldo"
+    "не могу снять", "не получается снять", "recibo de sueldo", "нет recibo de sueldo",
+    "sin recibo de sueldo", "sin garantía propietaria", "sin garantia propietaria",
+    "ingresos del exterior", "ingresos extranjeros", "monotributo"
 )
 RELOCATION = (
     "переехать в аргент", "переезд в аргент", "релокац", "лечу в буэнос", "прилетаю в буэнос",
@@ -74,7 +90,11 @@ PARTNER = (
 )
 PROMO = (
     "наша компания", "предлагаем услуги", "оказываю услуги", "пишите в личку", "обращайтесь",
-    "скидка", "акция", "в наличии", "#продажа", "#аренда", "подписывайтесь"
+    "скидка", "акция", "в наличии", "#продажа", "#аренда", "подписывайтесь",
+    "для новых клиентов", "записаться", "заказать", "стоимость услуги", "наши услуги",
+    "оказываем", "оказываю", "наша команда", "написать нам", "оставить заявку",
+    "к вашим услугам", "выполняем", "выполняю", "предлагаю", "предлагаем",
+    "помогаю", "поможем", "научу", "консультации", "услуга ", "запись в", "запись:"
 )
 
 def norm(value):
@@ -82,6 +102,22 @@ def norm(value):
 
 def has_any(text, cues):
     return any(x in text for x in cues)
+
+def has_personal_need(text):
+    head = (text or "")[:500]
+    strong = r"(?:ищу|ищем|хочу|хотим|планирую|планируем|собираюсь|собираемся|busco|necesito|quiero|queremos)"
+    if re.search(r"(?<![\wа-яё])" + strong + r"(?![\wа-яё])", head, re.I):
+        return True
+    weak = r"(?:нужен|нужна|нужно)"
+    if re.search(r"(?<![\wа-яё])" + weak + r"(?![\wа-яё])", head[:220], re.I):
+        return True
+    return has_any(head[:260], ("подскаж", "посовет", "кто знает", "как лучше", "alguien sabe", "cómo ", "como "))
+
+def has_question_intent(text):
+    head = (text or "")[:420]
+    return has_any(head, ("подскаж", "посовет", "кто знает", "как лучше", "где снять", "где купить",
+                          "как купить", "как снять", "alguien sabe", "cómo comprar", "como comprar",
+                          "dónde comprar", "donde comprar", "cómo alquilar", "como alquilar"))
 
 def connect():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -151,32 +187,45 @@ def classify(row):
     source = norm(row["chat_title"])
     arg_context = has_any(source, ARG_SOURCE) or has_any(text, ARG_GEO)
     prop = has_any(text, PROPERTY)
-    need = has_any(text, NEED) or "?" in text
+    need = has_personal_need(text)
+    question_intent = has_question_intent(text)
     buy = has_any(text, BUY)
     rent = has_any(text, RENT)
     self_signal = bool(re.search(r"(?:^|\s)(?:я|мы)(?:\s|$)|у меня|у нас|мне |нам |мой |моя |наши |продал|продала|продаем|перевожу|переводим|получил|получила|собираюсь|планирую", text))
     invest_raw = has_any(text, INVEST)
-    pre_raw = has_any(text, PREINTENT)
-    friction = has_any(text, RENT_FRICTION) and (need or "?" in text)
+    crypto_personal = has_any(text, ("usdt", "крипт", "crypto", "binance", "bybit")) and (need or question_intent)
+    pre_raw = has_any(text, PREINTENT) or crypto_personal
+    friction = has_any(text, RENT_FRICTION) and (need or question_intent) and (prop or rent)
     relocation = has_any(text, RELOCATION)
     owner = has_any(text, OWNER_DIRECT)
     sale = has_any(text, SALE) and prop
-    rent_supply = (has_any(text, RENT_SUPPLY) and prop) or (owner and prop and not sale and not buy and has_any(text, ("в месяц", "месяц аренды", "аренда", "депозит")))
-    invest = invest_raw and (need or self_signal)
-    pre = pre_raw and (need or self_signal) and not (sale or rent_supply)
-    partner = has_any(text, PARTNER)
+    head = text[:500]
+    explicit_rent_need = bool(re.search(r"(?:ищу|ищем|хочу|хотим|нужна|нужно|сниму|busco|quiero).{0,55}(?:квартир|жиль|студи|дом|departamento|depto|alquilar)", head, re.I))
+    listing_terms = has_any(text, ("/месяц", "в месяц", "usd/месяц", "ars в месяц", "депозит", "expensas", "alquiler temporario"))
+    listing_heading = bool(re.search(r"^(?:квартиры? в аренду|аренда в |alquiler |лот#?\d*\s+аренда)", text, re.I))
     promo = has_any(text, PROMO)
+    buyer_demand = buy and (need or question_intent or (self_signal and not promo))
+    rent_supply = (has_any(text, RENT_SUPPLY) and prop) or (listing_heading and prop) or (prop and listing_terms and not explicit_rent_need and not buyer_demand) or (owner and prop and not sale and not buyer_demand and listing_terms)
+    invest = invest_raw and (need or question_intent or (self_signal and not promo))
+    pre = pre_raw and (need or question_intent or (self_signal and not promo)) and not (sale or rent_supply)
+    partner = has_any(text, PARTNER)
+
+    money_signal = bool(re.search(r"(?:usd|usdt|u\$s|\$|eur|€)\s*\d|\d[\d., ]*\s*(?:usd|usdt|u\$s|eur|€)", text, re.I))
 
     tags, reasons, score = [], [], 0
     if arg_context:
         score += 15; reasons.append("Argentina context")
     if prop:
         score += 12; tags.append("property")
-    if need:
+    if need or question_intent:
         score += 12; reasons.append("personal need/question")
-    if buy:
+    if self_signal and (prop or invest_raw or pre_raw or relocation):
+        score += 8; reasons.append("first-person context")
+    if money_signal and (need or question_intent or self_signal):
+        score += 8; tags.append("money"); reasons.append("budget/capital amount")
+    if buyer_demand:
         score += 28; tags.append("buyer"); reasons.append("purchase intent")
-    if rent and (need or not rent_supply):
+    if rent and (explicit_rent_need or ((need or question_intent) and not rent_supply)):
         score += 25; tags.append("rental_demand"); reasons.append("rental demand")
     if invest:
         score += 24; tags.append("investor"); reasons.append("capital/investment intent")
@@ -194,11 +243,11 @@ def classify(row):
         score += 30; tags.append("owner_rental"); reasons.append("direct owner rental")
     elif rent_supply:
         score += 10; tags.append("rental_supply")
-    if partner and (need or owner or "рекоменд" in text or "контакт" in text):
+    if partner and (need or question_intent or owner or "рекоменд" in text or "контакт" in text):
         score += 12; tags.append("partner"); reasons.append("transaction partner signal")
 
     if promo and not owner:
-        score -= 18
+        score -= 30; reasons.append("publisher/service promo")
     if not arg_context and not (buy or invest or pre):
         score -= 20
     if not (prop or invest or pre or friction or relocation or owner):
@@ -238,6 +287,10 @@ def fingerprint(text):
 def insert_candidate(con, row, result):
     category, score, tags, reasons = result
     pk = person_key(row)
+    fp = fingerprint(row["text"])
+    duplicate = con.execute("SELECT id FROM candidates WHERE person_key=? AND fingerprint=? ORDER BY id DESC LIMIT 1", (pk, fp)).fetchone()
+    if duplicate:
+        return None
     prior = con.execute(
         "SELECT COUNT(*) c FROM candidates WHERE person_key=? AND occurred_at>=?",
         (pk, (utcnow()-timedelta(days=30)).isoformat())
@@ -256,7 +309,7 @@ def insert_candidate(con, row, result):
         row["id"], row["chat_id"], row["message_id"], pk, row["created_at"], row["chat_title"],
         row["sender_id"], row["sender_name"], row["sender_username"], category, score,
         ("argentina" if "Argentina context" in reasons else "other"), json.dumps(tags, ensure_ascii=False), json.dumps(reasons, ensure_ascii=False),
-        row["text"], row["link"], fingerprint(row["text"]), iso()
+        row["text"], row["link"], fp, iso()
     ))
     con.commit()
     if cur.rowcount != 1:
@@ -303,7 +356,7 @@ def alert_candidate(con, row):
     except Exception:
         occurred = utcnow()
     age = utcnow() - occurred
-    if row["score"] < ALERT_MIN_SCORE or age > timedelta(hours=ALERT_MAX_AGE_HOURS):
+    if row["region"] != "argentina" or row["score"] < ALERT_MIN_SCORE or age > timedelta(hours=ALERT_MAX_AGE_HOURS):
         return
     keyboard = [[
         {"text":"✅ Лид","callback_data":f"lead:{row['id']}"},
@@ -314,7 +367,8 @@ def alert_candidate(con, row):
     if row["link"]:
         keyboard.append([{"text":"Открыть оригинал","url":row["link"]}])
     if bot_send(render_candidate(con, row), keyboard):
-        con.execute("UPDATE candidates SET alerted_at=? WHERE id=?", (iso(), row["id"]))
+        ts = iso()
+        con.execute("UPDATE candidates SET alerted_at=?, shown_at=COALESCE(shown_at,?) WHERE id=?", (ts, ts, row["id"]))
         con.commit()
 
 def process_batch(con, raw, after_id, limit=1000):
