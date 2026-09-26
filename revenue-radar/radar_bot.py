@@ -3,6 +3,7 @@ import json, os, time, urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 from broad_radar import connect, render_candidate, iso
+from opportunity_state import connect as opp_connect, upsert_person, add_signal, add_or_update_opportunity
 
 TOKEN = os.environ["RADAR_ALERT_BOT_TOKEN"]
 ALLOWED_CHAT_ID = str(os.environ["RADAR_ALERT_CHAT_ID"])
@@ -145,6 +146,40 @@ def handle_command(con, text):
     else:
         send("Не понял команду. /help")
 
+CATEGORY_KIND = {
+    "PROPERTY_BUYER":"BUYER",
+    "PRE_INTENT":"PRE_INTENT",
+    "INVESTOR":"INVESTOR",
+    "RENTER":"RENTER",
+    "OWNER_DIRECT":"OWNER_DIRECT",
+    "OWNER_RENTAL":"OWNER_RENTAL",
+    "SUPPLY":"SUPPLY",
+    "PARTNER":"PARTNER",
+    "POTENTIAL":"OTHER",
+}
+
+def promote_to_opportunity(row):
+    con = opp_connect()
+    pid = upsert_person(
+        con, "telegram", row["sender_username"] or row["sender_name"] or row["person_key"],
+        str(row["sender_id"]) if row["sender_id"] else None,
+        row["sender_username"], row["sender_name"]
+    )
+    reasons = json.loads(row["reasons_json"] or "[]")
+    sid, _ = add_signal(
+        con, pid, "telegram", row["occurred_at"], row["chat_title"], row["category"],
+        int(row["score"]), None, row["text"], row["link"], reasons
+    )
+    kind = CATEGORY_KIND.get(row["category"], "OTHER")
+    label = ("@" + row["sender_username"]) if row["sender_username"] else (row["sender_name"] or row["person_key"])
+    priority = "HIGH" if int(row["score"]) >= 80 else "MEDIUM"
+    confidence = "HIGH" if int(row["score"]) >= 80 else "MEDIUM"
+    summary = " ".join((row["text"] or "").split())[:700]
+    return add_or_update_opportunity(
+        con, pid, kind, f"{kind} · {label}", "REVIEW", priority,
+        confidence, summary, sid
+    )
+
 def disposition_text(action):
     return {
         "lead":"QUALIFIED",
@@ -174,8 +209,14 @@ def handle_callback(con, cq):
         (state, iso(), action, cid)
     )
     con.commit()
+    opportunity_id = None
+    if action == "lead":
+        try:
+            opportunity_id = promote_to_opportunity(row)
+        except Exception as exc:
+            print(f"Opportunity promotion failed: {type(exc).__name__}: {str(exc)[:180]}", flush=True)
     labels = {
-        "lead":"Сохранено как лид",
+        "lead":("Сохранено как лид" + (f" · opportunity #{opportunity_id}" if opportunity_id else "")),
         "review":"Отмечено просмотренным",
         "noise":"Отмечено как шум",
         "later":"Отложено"
