@@ -507,25 +507,49 @@ def acquisition_metrics(
         bucket["impressions"] += int(impressions or 0)
         bucket["clicks"] += int(clicks or 0)
 
-    out = []
+    event_map: dict[tuple[str, str, str], dict[str, int]] = {}
     for source, medium, campaign, people, starts, listings, searches, availability, viewings, leads, wins in rows:
+        event_map[(source, medium, campaign)] = {
+            "people": int(people),
+            "bot_starts": int(starts),
+            "listing_opened": int(listings),
+            "search_submitted": int(searches),
+            "availability_requested": int(availability),
+            "viewing_requested": int(viewings),
+            "lead_qualified": int(leads),
+            "deal_won": int(wins),
+        }
+
+    # Include spend-only campaigns too. A campaign that spent money and produced zero
+    # events is commercially important and must never disappear from reporting.
+    out = []
+    for source, medium, campaign in sorted(set(event_map) | set(spend_map)):
+        metrics = event_map.get(
+            (source, medium, campaign),
+            {
+                "people": 0,
+                "bot_starts": 0,
+                "listing_opened": 0,
+                "search_submitted": 0,
+                "availability_requested": 0,
+                "viewing_requested": 0,
+                "lead_qualified": 0,
+                "deal_won": 0,
+            },
+        )
         spend = spend_map.get((source, medium, campaign), {"by_currency": {}, "impressions": 0, "clicks": 0})
         currencies = spend["by_currency"]
         unit_currency = next(iter(currencies)) if len(currencies) == 1 else None
         amount = currencies.get(unit_currency, 0.0) if unit_currency else None
+        leads = metrics["lead_qualified"]
+        viewings = metrics["viewing_requested"]
+        wins = metrics["deal_won"]
         out.append(
             {
                 "source": source,
                 "medium": medium,
                 "campaign": campaign,
-                "people": int(people),
-                "bot_starts": int(starts),
-                "listing_opened": int(listings),
-                "search_submitted": int(searches),
-                "availability_requested": int(availability),
-                "viewing_requested": int(viewings),
-                "lead_qualified": int(leads),
-                "deal_won": int(wins),
+                **metrics,
                 "spend": currencies,
                 "impressions": int(spend["impressions"]),
                 "clicks": int(spend["clicks"]),
