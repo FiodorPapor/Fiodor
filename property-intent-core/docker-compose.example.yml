@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - property_intent_pg:/var/lib/postgresql/data
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+    volumes:
+      - ./example-data/catalog.json:/data/catalog.json:ro
+      - ./example-data/quality.json:/data/quality.json:ro
+    ports:
+      - "127.0.0.1:8050:8080"
+
+volumes:
+  property_intent_pg:
