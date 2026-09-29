@@ -139,6 +139,7 @@ EVENT_NAMES = {
     "listing_opened",
     "gallery_opened",
     "share_clicked",
+    "share_sent",
     "search_started",
     "search_submitted",
     "notification_opt_in",
