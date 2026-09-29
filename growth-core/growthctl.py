@@ -223,8 +223,9 @@ def cmd_preflight(args):
 
 
 def build_parser():
+    env = read_env()
     p = argparse.ArgumentParser(description="Internal CLI for Growth Core")
-    p.add_argument("--tenant", default="lebleu")
+    p.add_argument("--tenant", default=env.get("DEFAULT_TENANT", "default"))
     sub = p.add_subparsers(dest="command", required=True)
 
     link = sub.add_parser("link", help="Create/reuse a deterministic acquisition link")
@@ -235,7 +236,7 @@ def build_parser():
     link.add_argument("--placement")
     link.add_argument("--listing")
     link.add_argument("--intent", default="miniapp")
-    link.add_argument("--bot", default="LeBleuArgentinaBot")
+    link.add_argument("--bot", default=env.get("DEFAULT_BOT_USERNAME", "Bot"))
     link.add_argument("--note")
     link.set_defaults(func=cmd_link)
 
@@ -269,9 +270,9 @@ def build_parser():
     preflight.add_argument("--token", required=True)
     preflight.add_argument("--days", type=int, default=30)
     preflight.add_argument("--require-clean", action="store_true")
-    preflight.add_argument("--intent-health", default="http://127.0.0.1:8050/health")
-    preflight.add_argument("--crm-health", default="http://127.0.0.1:8020/health")
-    preflight.add_argument("--catalog-url", default="https://lebleu-app.srv1636153.hstgr.cloud/api/v1/catalog")
+    preflight.add_argument("--intent-health", default=env.get("PREFLIGHT_INTENT_HEALTH", "http://127.0.0.1:8050/health"))
+    preflight.add_argument("--crm-health", default=env.get("PREFLIGHT_CRM_HEALTH", "http://127.0.0.1:8020/health"))
+    preflight.add_argument("--catalog-url", default=env.get("PREFLIGHT_CATALOG_URL", "http://127.0.0.1:8050/v1/catalog"))
     preflight.set_defaults(func=cmd_preflight)
     return p
 
