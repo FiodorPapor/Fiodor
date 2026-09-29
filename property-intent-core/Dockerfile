@@ -7,6 +7,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY data ./data
 RUN useradd --system --uid 10001 intent && chown -R intent:intent /srv
 USER intent
 CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8080"]
