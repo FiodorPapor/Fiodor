@@ -5,7 +5,11 @@
   "max_messages_per_group": 350,
   "poll_interval_seconds": 120,
   "public_poll_limit": 30,
-  "commercial_watch_usernames": ["nastya_koma", "black_groupPR", "emisale360"],
+  "commercial_watch_usernames": [
+    "nastya_koma",
+    "black_groupPR",
+    "emisale360"
+  ],
   "public_watch_groups": [
     "ciudadaniaArgentina",
     "vyezd_v_argentina",
@@ -546,5 +550,12 @@
   ],
   "live_watch_extra_titles": [
     "свидетели фернета"
+  ],
+  "commercial_campaign_watch": [
+    {
+      "chat_username": "BuenosAiresVibes",
+      "campaign": "ba_vibes_20260929_pilot",
+      "token": "CI4yrT4J68FQ"
+    }
   ]
 }
