@@ -89,6 +89,15 @@ function canSaveSearch(f:Filters){
 function normalizedSearch(value:string){
   return value.toLowerCase().replace(/ё/g,'е').replace(/[^a-záéíóúñüа-я0-9]+/gi,' ').trim();
 }
+async function ensureWriteAccess(){
+  if(!tg) return false;
+  if(tg.initDataUnsafe?.user?.allows_write_to_pm) return true;
+  if(typeof tg.requestWriteAccess!=='function') return true;
+  return await new Promise<boolean>(resolve=>{
+    try{ tg.requestWriteAccess((allowed:boolean)=>resolve(Boolean(allowed))); }
+    catch{ resolve(false); }
+  });
+}
 
 const DEFAULT_FILTERS:Filters={
   operation:'',query:'',neighborhoods:[],propertyTypes:[],rooms:null,maxBudget:'',budgetCurrency:'USD'
@@ -228,11 +237,21 @@ function App(){
     if(!initData){showToast('Откройте каталог внутри Telegram');return;}
     setBusy(true);
     try{
-      const res=await api<{telegram_url:string;share_url?:string}>('/api/v1/actions',{
+      const res=await api<{telegram_url:string;share_url?:string;prepared_message_id?:string}>('/api/v1/actions',{
         method:'POST',body:JSON.stringify({
           init_data:initData,listing_code:selected.code,action,link_token:trackingToken||undefined
         })
       });
+      if(action==='share'&&res.prepared_message_id&&typeof tg?.shareMessage==='function'){
+        const listingAtShare=selected;
+        tg.shareMessage(res.prepared_message_id,(sent:boolean)=>{
+          if(sent){
+            haptic('success');
+            event('share_sent',listingAtShare,{via:'prepared_message'});
+          }
+        });
+        return;
+      }
       haptic('success');
       const destination=action==='share'&&res.share_url?res.share_url:res.telegram_url;
       if(tg?.openTelegramLink) tg.openTelegramLink(destination);
@@ -245,6 +264,13 @@ function App(){
     if(!canSaveSearch(filters)){showToast('Добавьте район, тип, комнаты, бюджет или поисковый запрос');return;}
     setBusy(true);
     try{
+      if(notify){
+        const allowed=await ensureWriteAccess();
+        if(!allowed){
+          showToast('Разрешите сообщения от бота, чтобы получать новые варианты');
+          return;
+        }
+      }
       const res=await api<{label:string;matches_now:number}>('/api/v1/saved-searches',{
         method:'POST',
         body:JSON.stringify({
