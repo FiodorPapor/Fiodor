@@ -22,8 +22,11 @@ type SavedSearch = {id:string; label:string; criteria:Record<string,unknown>; no
 const tg = window.Telegram?.WebApp;
 const initData = tg?.initData || '';
 const startParam = String(tg?.initDataUnsafe?.start_param || '');
-const urlTracking = new URLSearchParams(window.location.search).get('trk') || '';
+const launchParams = new URLSearchParams(window.location.search);
+const urlTracking = launchParams.get('trk') || '';
 const trackingToken = urlTracking || (startParam.startsWith('trk_') ? startParam.slice(4) : '');
+const requestedListing = launchParams.get('listing') || '';
+const requestedSavedSearch = launchParams.get('saved') || '';
 
 function api<T>(path:string, options?:RequestInit):Promise<T>{
   return fetch(path,{
@@ -64,8 +67,27 @@ function filtersToCriteria(f:Filters){
     budgetCurrency:f.maxBudget?f.budgetCurrency:undefined,
   };
 }
+function criteriaToFilters(criteria:Record<string,unknown>):Filters{
+  const neighborhoods=Array.isArray(criteria.neighborhoods)?criteria.neighborhoods.map(String):[];
+  const propertyTypes=Array.isArray(criteria.propertyTypes)?criteria.propertyTypes.map(String):[];
+  return {
+    operation:typeof criteria.operation==='string'?criteria.operation:'',
+    query:typeof criteria.query==='string'?criteria.query:'',
+    neighborhoods,
+    propertyTypes,
+    rooms:criteria.rooms?Number(criteria.rooms):null,
+    maxBudget:criteria.maxBudget?String(criteria.maxBudget):'',
+    budgetCurrency:typeof criteria.budgetCurrency==='string'?criteria.budgetCurrency:'USD',
+  };
+}
 function activeFilterCount(f:Filters){
   return (f.operation?1:0)+(f.query?1:0)+f.neighborhoods.length+f.propertyTypes.length+(f.rooms?1:0)+(f.maxBudget?1:0);
+}
+function canSaveSearch(f:Filters){
+  return Boolean(f.query.trim()||f.neighborhoods.length||f.propertyTypes.length||f.rooms||f.maxBudget);
+}
+function normalizedSearch(value:string){
+  return value.toLowerCase().replace(/ё/g,'е').replace(/[^a-záéíóúñüа-я0-9]+/gi,' ').trim();
 }
 
 const DEFAULT_FILTERS:Filters={
@@ -98,6 +120,12 @@ function App(){
     api<Catalog>('/api/v1/catalog').then(data=>{
       setCatalog(data);
       if(initData) event('catalog_opened');
+      if(requestedListing){
+        const item=data.items.find(x=>x.code===requestedListing);
+        if(item) openListing(item);
+      }else if(requestedSavedSearch&&initData){
+        restoreSavedSearch(requestedSavedSearch);
+      }
     }).catch(err=>showToast(err.message));
   },[]);
 
@@ -160,7 +188,8 @@ function App(){
 
   const results=useMemo(()=>{
     if(!catalog) return [];
-    const q=filters.query.trim().toLowerCase();
+    const q=normalizedSearch(filters.query);
+    const queryTokens=q.split(/\s+/).filter(x=>x.length>=3&&!['квартира','квартиру','дом','ищу','нужна'].includes(x));
     return catalog.items.filter(item=>{
       if(filters.operation&&item.operation!==filters.operation) return false;
       if(filters.neighborhoods.length&&!filters.neighborhoods.some(x=>item.neighborhoods.includes(x))) return false;
@@ -170,9 +199,9 @@ function App(){
         if(item.priceCurrency!==filters.budgetCurrency) return false;
         if(Number(item.priceAmount||0)>Number(filters.maxBudget)) return false;
       }
-      if(q){
-        const hay=[item.address,item.propertyType,item.code,item.description,...item.neighborhoods].join(' ').toLowerCase();
-        if(!hay.includes(q)) return false;
+      if(queryTokens.length){
+        const hay=normalizedSearch([item.address,item.description,...item.highlightedFeatures,...item.neighborhoods].join(' '));
+        if(!queryTokens.some(token=>hay.includes(token))) return false;
       }
       return true;
     });
@@ -212,7 +241,7 @@ function App(){
   }
   async function saveSearch(){
     if(!initData){showToast('Сохранение доступно внутри Telegram');return;}
-    if(activeFilterCount(filters)===0){showToast('Добавьте хотя бы один критерий');return;}
+    if(!canSaveSearch(filters)){showToast('Добавьте район, тип, комнаты, бюджет или поисковый запрос');return;}
     setBusy(true);
     try{
       const res=await api<{label:string;matches_now:number}>('/api/v1/saved-searches',{
@@ -226,6 +255,20 @@ function App(){
       showToast(notify?`Поиск сохранён · сейчас ${res.matches_now}`:'Поиск сохранён');
     }catch(err:any){showToast(err.message||'Не удалось сохранить');}
     finally{setBusy(false);}
+  }
+  async function restoreSavedSearch(id:string){
+    try{
+      const res=await api<{items:SavedSearch[]}>(`/api/v1/saved-searches?init_data=${encodeURIComponent(initData)}`);
+      setSaved(res.items);
+      const found=res.items.find(item=>item.id===id);
+      if(found){
+        setFilters(criteriaToFilters(found.criteria));
+        searchStarted.current=true;
+        showToast('Ваш сохранённый поиск');
+      }
+    }catch(err:any){
+      showToast(err.message||'Не удалось открыть сохранённый поиск');
+    }
   }
   async function loadSaved(){
     try{
@@ -274,7 +317,7 @@ function App(){
       <div className="searchBox">
         <Search size={20}/>
         <input value={filters.query} onChange={e=>update({query:e.target.value})}
-          placeholder="Район, адрес или код объекта" aria-label="Поиск"/>
+          placeholder="Район, город, адрес или код объекта" aria-label="Поиск"/>
         {filters.query&&<button onClick={()=>update({query:''})} aria-label="Очистить"><X size={18}/></button>}
       </div>
 
@@ -296,13 +339,15 @@ function App(){
         {!results.length&&<div className="emptyState">
           <div className="emptyIcon"><Search size={26}/></div>
           <h3>Точного совпадения нет</h3>
-          <p>Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.</p>
-          <button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>
+          <p>{canSaveSearch(filters)
+            ?'Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.'
+            :'Добавьте район, тип объекта, комнаты, бюджет или поисковый запрос, чтобы сохранить поиск.'}</p>
+          {canSaveSearch(filters)&&<button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>}
         </div>}
       </section>
     </main>
 
-    {activeFilterCount(filters)>0&&results.length>0&&
+    {canSaveSearch(filters)&&results.length>0&&
       <div className="stickySave"><button onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск <span>{results.length}</span></button></div>}
 
     {filtersOpen&&<FilterSheet filters={filters} propertyTypes={propertyTypes} neighborhoods={catalog.neighborhoods}
@@ -326,7 +371,7 @@ function ListingCard({item,onOpen}:{item:Listing;onOpen:()=>void}){
     </div>
     <div className="cardBody">
       <div className="cardPrice">{fmtPrice(item)}</div>
-      <div className="cardTitle">{item.propertyType} · {item.address||item.code}</div>
+      <div className="cardTitle">{translateType(item.propertyType)} · {item.address||item.code}</div>
       {spec(item)&&<div className="cardSpecs">{spec(item)}</div>}
       {item.neighborhoods[0]&&<div className="cardLocation"><MapPin size={14}/>{prettyHood(item.neighborhoods[0])}</div>}
     </div>
@@ -352,7 +397,7 @@ function ListingDetail({item,busy,onBack,onAction,onGallery}:{item:Listing;busy:
       {item.images.length>1&&<span className="galleryCount">{photo+1} / {item.images.length}</span>}
     </div>
     <div className="detailBody">
-      <div className="detailMeta">{item.operation==='Venta'?'ПРОДАЖА':'АРЕНДА'} · {item.propertyType}</div>
+      <div className="detailMeta">{item.operation==='Venta'?'ПРОДАЖА':'АРЕНДА'} · {translateType(item.propertyType)}</div>
       <h1>{item.address||item.code}</h1>
       <div className="detailPrice">{fmtPrice(item)}</div>
       {spec(item)&&<div className="specGrid">
@@ -388,7 +433,7 @@ function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate
     <div className="sheet tall">
       <div className="sheetHandle"/><div className="sheetHead"><div><span>Фильтры</span><strong>{count} объектов</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
       <div className="sheetScroll">
-        <section className="filterSection"><h3>Район</h3><div className="chipsWrap">
+        <section className="filterSection"><h3>Район / город</h3><div className="chipsWrap">
           {neighborhoods.map((x:string)=><button key={x} className={filters.neighborhoods.includes(x)?'chip active':'chip'} onClick={()=>onToggleHood(x)}>{prettyHood(x)}</button>)}
         </div></section>
         <section className="filterSection"><h3>Тип объекта</h3><div className="chipsWrap">
@@ -434,8 +479,23 @@ function SavedSheet({items,onClose,onDelete}:{items:SavedSearch[];onClose:()=>vo
   </div>;
 }
 
-function prettyHood(x:string){return x==='nunez'?'Núñez':x.split(' ').map(w=>w[0].toUpperCase()+w.slice(1)).join(' ')}
-function translateType(x:string){return ({Departamento:'Квартира',Casa:'Дом',PH:'PH',Cochera:'Парковка',Local:'Коммерция',Terreno:'Участок',Oficina:'Офис'} as any)[x]||x}
+function prettyHood(x:string){
+  const known:Record<string,string>={
+    nunez:'Núñez',canuelas:'Cañuelas',martinez:'Martínez',
+    'san nicolas':'San Nicolás','san cristobal':'San Cristóbal',
+    'general rodriguez':'General Rodríguez','general pueyrredon':'General Pueyrredón',
+    'vicente lopez':'Vicente López','velez sarsfield':'Vélez Sarsfield'
+  };
+  return known[x]||x.split(' ').map(w=>w[0].toUpperCase()+w.slice(1)).join(' ');
+}
+function translateType(x:string){
+  return ({
+    Departamento:'Квартира',Casa:'Дом',PH:'PH',Cochera:'Парковка',
+    'Local Comercial':'Коммерция',Local:'Коммерция',
+    'Terreno o Lote':'Участок',Terreno:'Участок',
+    Oficina:'Офис','Depósito':'Склад',Propiedad:'Недвижимость'
+  } as any)[x]||x;
+}
 function plural(n:number,one:string,few:string,many:string){const x=Math.abs(n)%100,y=x%10;if(x>10&&x<20)return many;if(y>1&&y<5)return few;if(y===1)return one;return many}
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App/></React.StrictMode>);
