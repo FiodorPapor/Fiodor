@@ -5,11 +5,12 @@ import hmac
 import json
 import os
 import re
+import unicodedata
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlencode
 from uuid import UUID, uuid4
 
 import httpx
@@ -39,6 +40,8 @@ class Settings(BaseSettings):
     crm_api_key: str = ""
     catalog_path: str = "/data/catalog.json"
     quality_path: str = "/data/quality.json"
+    geo_enrichment_path: str = "/data/geo-enrichment.json"
+    caba_barrios_path: str = "/srv/data/reference/caba-barrios.geojson"
     init_data_max_age_seconds: int = 86400
     test_telegram_ids: str = ""
 
@@ -90,19 +93,21 @@ class SavedSearchMatch(Base):
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-NEIGHBORHOODS = {
+# Text aliases are a fallback. When coordinates fall inside CABA, the official
+# Buenos Aires Data barrio polygon is authoritative and these hints are ignored.
+CABA_TEXT_ALIASES = {
     "palermo": ["palermo", "botanico", "botánico", "las cañitas", "las canitas"],
-    "recoleta": ["recoleta"],
+    "recoleta": ["recoleta", "barrio norte"],
     "belgrano": ["belgrano"],
     "nunez": ["núñez", "nunez", "nuñez"],
-    "colegiales": ["colegiales"],
+    "colegiales": ["colegiales", "coleiales"],
     "villa urquiza": ["villa urquiza"],
     "caballito": ["caballito"],
     "chacarita": ["chacarita"],
     "villa crespo": ["villa crespo"],
     "barracas": ["barracas"],
-    "balvanera": ["balvanera"],
-    "san nicolas": ["san nicolás", "san nicolas"],
+    "balvanera": ["balvanera", "congreso"],
+    "san nicolas": ["san nicolás", "san nicolas", "microcentro"],
     "retiro": ["retiro"],
     "puerto madero": ["puerto madero"],
     "almagro": ["almagro"],
@@ -111,13 +116,67 @@ NEIGHBORHOODS = {
     "parque chas": ["parque chas"],
     "villa devoto": ["villa devoto"],
     "villa del parque": ["villa del parque"],
+    "villa santa rita": ["villa santa rita"],
+    "monte castro": ["monte castro"],
     "flores": ["flores"],
     "floresta": ["floresta"],
     "boedo": ["boedo"],
     "san cristobal": ["san cristóbal", "san cristobal"],
+}
+
+# Explicit non-CABA locality/project names. Avoid generic street names here:
+# zero location is better than assigning a property to the wrong market.
+OUTSIDE_LOCATION_ALIASES = {
     "la plata": ["la plata"],
     "city bell": ["city bell"],
+    "olivos": ["olivos"],
+    "martinez": ["martínez", "martinez"],
+    "la martona": ["la martona"],
+    "canuelas": ["cañuelas", "canuelas"],
+    "carabassa": ["carabassa"],
+    "ingeniero maschwitz": ["ingeniero maschwitz"],
+    "pilar": ["pilar centro", " pilar ", "duplex en pilar"],
+    "escobar": ["escobar", "puertos de escobar"],
+    "aranzazu": ["aranzazu"],
+    "nordelta": ["nordelta"],
+    "san isidro": ["san isidro"],
+    "lomas de zamora": ["lomas de zamora"],
+    "longchamps": ["longchamps"],
+    "general rodriguez": ["general rodriguez", "general rodríguez"],
+    "florida": ["florida v lopez", "florida vicente lopez", "florida vicente lópez"],
+    "mar del plata": ["mar del plata"],
+    "mar de las pampas": ["mar de las pampas"],
+    "villa gesell": ["villa gesell"],
+    "lobos": ["lobos"],
+    "dolores": ["dolores provincia", "dolores"],
+    "navarro": ["navarro"],
 }
+DESCRIPTION_LOCATION_ALIASES = {
+    # High-specificity names that are safe to accept from the listing prose.
+    "martinez": ["martínez", "martinez"],
+    "la martona": ["la martona"],
+    "canuelas": ["cañuelas", "canuelas"],
+    "carabassa": ["carabassa"],
+    "ingeniero maschwitz": ["ingeniero maschwitz"],
+}
+
+# Verified parent-market relationships for named projects/localities. These make
+# specific searches useful while preventing a bad source-map pin from inventing
+# a contradictory municipality.
+LOCATION_PARENT = {
+    "olivos": "vicente lopez",
+    "martinez": "san isidro",
+    "la martona": "canuelas",
+    "carabassa": "pilar",
+    "ingeniero maschwitz": "escobar",
+    "aranzazu": "escobar",
+    "city bell": "la plata",
+    "mar de las pampas": "villa gesell",
+    "longchamps": "almirante brown",
+    "florida": "vicente lopez",
+    "nordelta": "tigre",
+}
+
 FEATURE_ALIASES = {
     "balcon": ["balcón", "balcon"],
     "pileta": ["pileta", "piscina"],
@@ -163,7 +222,76 @@ def db():
 
 
 def _norm(value: Any) -> str:
-    return " ".join(str(value or "").lower().replace("ё", "е").split())
+    value = str(value or "").lower().replace("ё", "е")
+    # Slugs and source URLs encode neighbourhoods with hyphens. Normalize all
+    # punctuation to spaces so "villa-crespo" and "Villa Crespo" match identically.
+    value = re.sub(r"[^a-záéíóúñüа-я0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _canonical_location(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    asciiish = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    asciiish = re.sub(r"[^a-zA-Z0-9]+", " ", asciiish).lower()
+    return " ".join(asciiish.split())
+
+
+@lru_cache(maxsize=1)
+def _caba_features() -> list[dict[str, Any]]:
+    data = _load_json(settings.caba_barrios_path, {})
+    features = data.get("features") if isinstance(data, dict) else []
+    return features if isinstance(features, list) else []
+
+
+def _point_in_ring(longitude: float, latitude: float, ring: list[list[float]]) -> bool:
+    inside = False
+    if len(ring) < 3:
+        return False
+    j = len(ring) - 1
+    for i, point in enumerate(ring):
+        xi, yi = float(point[0]), float(point[1])
+        xj, yj = float(ring[j][0]), float(ring[j][1])
+        crosses = (yi > latitude) != (yj > latitude)
+        if crosses:
+            x_at_lat = (xj - xi) * (latitude - yi) / (yj - yi) + xi
+            if longitude < x_at_lat:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon(longitude: float, latitude: float, coordinates: list[Any]) -> bool:
+    if not coordinates or not _point_in_ring(longitude, latitude, coordinates[0]):
+        return False
+    return not any(_point_in_ring(longitude, latitude, hole) for hole in coordinates[1:])
+
+
+def _caba_barrio(longitude: float, latitude: float) -> str | None:
+    # Cheap bounding box first: avoids polygon work for GBA / Provincia inventory.
+    if not (-58.55 <= longitude <= -58.33 and -34.71 <= latitude <= -34.52):
+        return None
+    for feature in _caba_features():
+        geometry = feature.get("geometry") or {}
+        coordinates = geometry.get("coordinates") or []
+        kind = geometry.get("type")
+        hit = False
+        if kind == "Polygon":
+            hit = _point_in_polygon(longitude, latitude, coordinates)
+        elif kind == "MultiPolygon":
+            hit = any(_point_in_polygon(longitude, latitude, polygon) for polygon in coordinates)
+        if hit:
+            name = str((feature.get("properties") or {}).get("nombre") or "").strip()
+            return _canonical_location(name) if name else None
+    return None
+
+
+def _alias_matches(blob: str, aliases_by_name: dict[str, list[str]]) -> list[str]:
+    padded = f" {blob} "
+    matches: list[str] = []
+    for name, aliases in aliases_by_name.items():
+        if any(f" {_norm(alias)} " in padded for alias in aliases):
+            matches.append(name)
+    return matches
 
 
 def _load_json(path: str, fallback: Any):
@@ -173,7 +301,12 @@ def _load_json(path: str, fallback: Any):
         return fallback
 
 
-_catalog_cache: dict[str, Any] = {"mtime": 0.0, "quality_mtime": 0.0, "items": []}
+_catalog_cache: dict[str, Any] = {
+    "mtime": 0.0,
+    "quality_mtime": 0.0,
+    "geo_mtime": 0.0,
+    "items": [],
+}
 
 
 def _catalog() -> list[dict[str, Any]]:
@@ -182,10 +315,21 @@ def _catalog() -> list[dict[str, Any]]:
         qtime = os.path.getmtime(settings.quality_path)
     except OSError:
         return []
-    if _catalog_cache["items"] and _catalog_cache["mtime"] == mtime and _catalog_cache["quality_mtime"] == qtime:
+    try:
+        gtime = os.path.getmtime(settings.geo_enrichment_path)
+    except OSError:
+        gtime = 0.0
+    if (
+        _catalog_cache["items"]
+        and _catalog_cache["mtime"] == mtime
+        and _catalog_cache["quality_mtime"] == qtime
+        and _catalog_cache["geo_mtime"] == gtime
+    ):
         return _catalog_cache["items"]
     raw = _load_json(settings.catalog_path, [])
     quality = _load_json(settings.quality_path, {})
+    geo_payload = _load_json(settings.geo_enrichment_path, {})
+    geo_entries = geo_payload.get("entries", {}) if isinstance(geo_payload, dict) else {}
     items: list[dict[str, Any]] = []
     for src in raw:
         q = quality.get(src.get("sourceUrl")) or {}
@@ -205,15 +349,26 @@ def _catalog() -> list[dict[str, Any]]:
             "highlightedFeatures": src.get("highlightedFeatures") or [],
             "description": (q.get("summary_ru") if current else None) or src.get("description") or "",
             "notes": (q.get("notes_ru") if current else []) or [],
-            "images": (src.get("imageUrls") or [])[:16],
+            # Keep the complete source gallery for the detail endpoint. The
+            # catalogue summary below still returns only the first image, so list
+            # payloads stay light while “all photos” really means all photos.
+            "images": src.get("imageUrls") or [],
             "sourceUrl": src.get("sourceUrl"),
             "slug": src.get("slug"),
+            "latitude": src.get("latitude"),
+            "longitude": src.get("longitude"),
+            "geo": geo_entries.get(src.get("sourceUrl")) or {},
             "sourceFingerprint": src.get("sourceFingerprint") or "",
         }
         item["neighborhoods"] = _listing_neighborhoods(item)
         item["listingToken"] = _listing_token(item)
         items.append(item)
-    _catalog_cache.update({"mtime": mtime, "quality_mtime": qtime, "items": items})
+    _catalog_cache.update({
+        "mtime": mtime,
+        "quality_mtime": qtime,
+        "geo_mtime": gtime,
+        "items": items,
+    })
     return items
 
 
@@ -224,8 +379,53 @@ def _listing_token(item: dict[str, Any]) -> str:
 
 
 def _listing_neighborhoods(item: dict[str, Any]) -> list[str]:
-    blob = _norm(" ".join([str(item.get("address") or ""), str(item.get("slug") or "")]))
-    return [name for name, aliases in NEIGHBORHOODS.items() if any(alias in blob for alias in aliases)]
+    primary_blob = _norm(" ".join([
+        str(item.get("address") or ""),
+        str(item.get("slug") or ""),
+    ]))
+    prose_blob = _norm(" ".join([
+        primary_blob,
+        str(item.get("description") or ""),
+    ]))
+    latitude = _safe_num(item.get("latitude"))
+    longitude = _safe_num(item.get("longitude"))
+
+    if latitude is not None and longitude is not None:
+        official = _caba_barrio(longitude, latitude)
+        if official:
+            return [official]
+
+        # Coordinates prove the listing is outside CABA. Preserve a specific
+        # project/locality hint (Nordelta, Aranzazu, etc.) and add the official
+        # Georef local government so broader searches still find the property.
+        locations = list(dict.fromkeys(
+            _alias_matches(primary_blob, OUTSIDE_LOCATION_ALIASES)
+            + _alias_matches(prose_blob, DESCRIPTION_LOCATION_ALIASES)
+        ))
+        expected_parents = {
+            LOCATION_PARENT[name]
+            for name in locations
+            if name in LOCATION_PARENT
+        }
+        locations.extend(sorted(expected_parents))
+
+        geo = item.get("geo") or {}
+        government = str(geo.get("localGovernment") or geo.get("department") or "").strip()
+        if government:
+            canonical = _canonical_location(government)
+            if canonical and not canonical.startswith("comuna "):
+                # If a named project/locality has a verified parent market, reject
+                # a conflicting map pin instead of showing a false municipality.
+                if not expected_parents or canonical in expected_parents:
+                    locations.append(canonical)
+        return list(dict.fromkeys(locations))
+
+    # Legacy/source pages without coordinates: conservative textual fallback.
+    return list(dict.fromkeys(
+        _alias_matches(primary_blob, CABA_TEXT_ALIASES)
+        + _alias_matches(primary_blob, OUTSIDE_LOCATION_ALIASES)
+        + _alias_matches(prose_blob, DESCRIPTION_LOCATION_ALIASES)
+    ))
 
 
 def _listing_blob(item: dict[str, Any]) -> str:
@@ -401,6 +601,40 @@ def _ensure_link(item: dict[str, Any], *, source: str, medium: str, campaign: st
         )
         response.raise_for_status()
         return response.json()
+    except Exception:
+        return None
+
+
+def _ensure_intent_link(
+    *,
+    source: str,
+    medium: str,
+    campaign: str,
+    content: str,
+    placement: str,
+    intent: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    try:
+        response = httpx.post(
+            f"{settings.growth_core_url.rstrip('/')}/v1/links/ensure",
+            json={
+                "tenant": settings.growth_tenant,
+                "source": source,
+                "medium": medium,
+                "campaign": campaign,
+                "content": content,
+                "placement": placement,
+                "intent": intent,
+                "bot_username": settings.telegram_bot_username,
+                "metadata": metadata or {},
+            },
+            headers={"X-Growth-Key": settings.growth_core_key},
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
@@ -592,19 +826,38 @@ def session(body: SessionIn):
 
 @app.post("/v1/events")
 def capture_event(body: EventIn):
-    allowed = {"catalog_opened", "listing_opened", "gallery_opened", "search_started", "search_submitted", "share_clicked"}
+    allowed = {
+        "catalog_opened",
+        "listing_opened",
+        "gallery_opened",
+        "search_started",
+        "search_submitted",
+        "share_clicked",
+        "notification_clicked",
+    }
     if body.event_name not in allowed:
         raise HTTPException(status_code=422, detail="Unsupported event")
     ctx = _validate_init_data(body.init_data)
     item = next((x for x in _catalog() if x.get("code") == body.listing_code), None) if body.listing_code else None
     link_token = _tracking_token(body.link_token, ctx)
+    user_id = int(ctx["user"]["id"])
     _growth_event(
-        int(ctx["user"]["id"]),
+        user_id,
         body.event_name,
         listing_token=item.get("listingToken") if item else None,
         properties=body.properties,
         link_token=link_token,
     )
+    if body.event_name == "catalog_opened" and link_token:
+        attribution = _growth_link(link_token) or {}
+        if attribution.get("source") == "saved_search":
+            _growth_event(
+                user_id,
+                "notification_clicked",
+                listing_token=item.get("listingToken") if item else None,
+                properties={"via": "miniapp"},
+                link_token=link_token,
+            )
     return {"ok": True}
 
 
@@ -810,6 +1063,16 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
         chosen = [item for item, _ in pending[:3]]
         lines = ["✨ <b>Появились новые варианты по вашему поиску</b>", search.label, ""]
         keyboard = []
+        catalog_link = _ensure_intent_link(
+            source="saved_search",
+            medium="owned",
+            campaign="reactivation",
+            content="saved_search",
+            placement="telegram_notification",
+            intent="saved_search",
+            metadata={"saved_search_id": str(search.id)},
+        )
+        catalog_token = str((catalog_link or {}).get("token") or "")
         for item in chosen:
             price = f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}".strip()
             lines.append(f"• {item.get('address') or item.get('code')} · {price}")
@@ -821,11 +1084,22 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
                 content="new_match",
                 placement="telegram_notification",
             )
-            url = (link or {}).get("telegram_url") or f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
-            keyboard.append([{"text": f"Открыть {item.get('code')}", "url": url}])
+            item_token = str((link or {}).get("token") or "")
+            params = {"listing": str(item.get("code") or "")}
+            if item_token:
+                params["trk"] = item_token
+            url = f"{settings.miniapp_url.rstrip('/')}?{urlencode(params)}"
+            keyboard.append([{
+                "text": f"Открыть {item.get('code')}",
+                "web_app": {"url": url},
+            }])
         if len(pending) > 3:
             lines.append(f"\nИ ещё {len(pending) - 3} новых.")
-        keyboard.append([{"text": "Открыть каталог", "web_app": {"url": settings.miniapp_url}}])
+        catalog_params = {"saved": str(search.id)}
+        if catalog_token:
+            catalog_params["trk"] = catalog_token
+        catalog_url = f"{settings.miniapp_url.rstrip('/')}?{urlencode(catalog_params)}"
+        keyboard.append([{"text": "Открыть мой поиск", "web_app": {"url": catalog_url}}])
         delivery_attempts += 1
         sent = _bot_send(search.telegram_user_id, "\n".join(lines), {"inline_keyboard": keyboard})
         now = datetime.now(UTC)
@@ -838,6 +1112,7 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
                 search.telegram_user_id,
                 "notification_sent",
                 properties={"saved_search_id": str(search.id), "new_matches": len(pending)},
+                link_token=catalog_token or None,
             )
         else:
             delivery_failures += 1
