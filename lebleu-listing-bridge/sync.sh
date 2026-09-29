@@ -8,6 +8,9 @@ cd "$ROOT"
 echo "[$(date -Is)] scan start"
 npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @LeBleuArgentinaBot --chat-id @PREVIEW_ONLY
 
+echo "[$(date -Is)] catalog quality normalization"
+timeout 180s node scripts/normalize-catalog-quality.mjs
+
 # Official Argentina Georef reverse-geocoding is enrichment only. Keep the last
 # successful cache if the public API is temporarily unavailable.
 echo "[$(date -Is)] geo enrichment"
