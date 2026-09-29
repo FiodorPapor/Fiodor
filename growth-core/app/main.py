@@ -168,7 +168,7 @@ FUNNEL = [
 
 
 class EnsureLinkIn(BaseModel):
-    tenant: str = "lebleu"
+    tenant: str = settings.default_tenant
     source: str = Field(min_length=1, max_length=80)
     medium: str = Field(min_length=1, max_length=80)
     campaign: str = Field(min_length=1, max_length=120)
@@ -181,7 +181,7 @@ class EnsureLinkIn(BaseModel):
 
 
 class EventIn(BaseModel):
-    tenant: str = "lebleu"
+    tenant: str = settings.default_tenant
     event_name: str
     actor_external_id: str | int | None = None
     anonymous_id: str | None = Field(default=None, max_length=120)
@@ -199,7 +199,7 @@ class EventIn(BaseModel):
 
 
 class SpendIn(BaseModel):
-    tenant: str = "lebleu"
+    tenant: str = settings.default_tenant
     source: str
     medium: str
     campaign: str
@@ -329,7 +329,7 @@ def ensure_link(body: EnsureLinkIn, session: Session = Depends(db)):
 
 
 @app.get("/v1/links/{token}", dependencies=[Depends(require_key)])
-def get_link(token: str, tenant: str = Query("lebleu"), session: Session = Depends(db)):
+def get_link(token: str, tenant: str = Query(settings.default_tenant), session: Session = Depends(db)):
     t = _tenant(session, tenant)
     row = session.scalar(
         select(TrackingLink).where(TrackingLink.tenant_id == t.id, TrackingLink.token == token)
@@ -415,7 +415,7 @@ def _window(days: int):
 
 @app.get("/v1/metrics/funnel", dependencies=[Depends(require_key)])
 def funnel_metrics(
-    tenant: str = Query("lebleu"),
+    tenant: str = Query(settings.default_tenant),
     days: int = Query(30, ge=1, le=3650),
     source: str | None = None,
     campaign: str | None = None,
@@ -455,7 +455,7 @@ def funnel_metrics(
 
 @app.get("/v1/metrics/acquisition", dependencies=[Depends(require_key)])
 def acquisition_metrics(
-    tenant: str = Query("lebleu"),
+    tenant: str = Query(settings.default_tenant),
     days: int = Query(30, ge=1, le=3650),
     include_test: bool = False,
     session: Session = Depends(db),
@@ -588,7 +588,7 @@ def acquisition_metrics(
 
 @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_key)])
 def dashboard(
-    tenant: str = Query("lebleu"),
+    tenant: str = Query(settings.default_tenant),
     days: int = Query(30, ge=1, le=3650),
     session: Session = Depends(db),
 ):
