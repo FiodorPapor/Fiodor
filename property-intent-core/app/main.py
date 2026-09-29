@@ -28,13 +28,15 @@ class Settings(BaseSettings):
     database_url: str
     service_key: str
     telegram_bot_token: str
-    telegram_bot_username: str = "LeBleuArgentinaBot"
+    telegram_bot_username: str = "AgencyCatalogBot"
     operator_chat_id: str = ""
     growth_core_url: str = "http://growth-core-api:8080"
     growth_core_key: str
-    growth_tenant: str = "lebleu"
-    brand_name: str = "Le Bleu"
-    crm_source: str = "lebleu_miniapp"
+    growth_tenant: str = "default"
+    brand_name: str = "Agency"
+    brand_tagline: str = ""
+    share_footer: str = ""
+    crm_source: str = "property_miniapp"
     crm_saved_search_type: str = "property_saved_search"
     miniapp_url: str = "https://lebleu-app.srv1636153.hstgr.cloud"
     crm_base_url: str = ""
@@ -696,7 +698,7 @@ def _prepared_share_message(
     share_target: str,
 ) -> str | None:
     price = f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}".strip()
-    address = str(item.get("address") or item.get("code") or "Объект Le Bleu")
+    address = str(item.get("address") or item.get("code") or f"Объект {settings.brand_name}")
     details = item.get("details") or {}
     specs = []
     if details.get("rooms"):
@@ -707,7 +709,8 @@ def _prepared_share_message(
     caption = f"<b>{html.escape(address)}</b>\n{html.escape(price)}"
     if specs:
         caption += "\n" + html.escape(" · ".join(specs))
-    caption += "\n\nLe Bleu · недвижимость в Аргентине"
+    footer = settings.share_footer.strip() or settings.brand_name
+    caption += "\n\n" + html.escape(footer)
 
     images = item.get("images") or []
     result_id = hashlib.sha256(
@@ -944,6 +947,15 @@ def health():
     return {"status": "ok", "service": "property-intent-core", "version": "0.1.0"}
 
 
+@app.get("/v1/config")
+def public_config():
+    return {
+        "brandName": settings.brand_name,
+        "brandTagline": settings.brand_tagline,
+        "botUsername": settings.telegram_bot_username,
+    }
+
+
 def _catalog_summary(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "code": item.get("code"),
@@ -981,7 +993,13 @@ def catalog():
 
 @app.get("/v1/catalog/{code}")
 def catalog_detail(code: str):
-    item = next((x for x in _catalog() if x.get("code") == code), None)
+    item = next(
+        (
+            x for x in _catalog()
+            if x.get("listingToken") == code or x.get("code") == code
+        ),
+        None,
+    )
     if not item:
         raise HTTPException(status_code=404, detail="Listing not found")
     return {**item, "photoCount": len(item.get("images") or [])}
@@ -1009,7 +1027,13 @@ def capture_event(body: EventIn):
     if body.event_name not in allowed:
         raise HTTPException(status_code=422, detail="Unsupported event")
     ctx = _validate_init_data(body.init_data)
-    item = next((x for x in _catalog() if x.get("code") == body.listing_code), None) if body.listing_code else None
+    item = next(
+        (
+            x for x in _catalog()
+            if x.get("listingToken") == body.listing_code or x.get("code") == body.listing_code
+        ),
+        None,
+    ) if body.listing_code else None
     link_token = _tracking_token(body.link_token, ctx)
     user_id = int(ctx["user"]["id"])
     _growth_event(
@@ -1035,7 +1059,13 @@ def capture_event(body: EventIn):
 @app.post("/v1/actions")
 def action(body: ActionIn):
     ctx = _validate_init_data(body.init_data)
-    item = next((x for x in _catalog() if x.get("code") == body.listing_code), None)
+    item = next(
+        (
+            x for x in _catalog()
+            if x.get("listingToken") == body.listing_code or x.get("code") == body.listing_code
+        ),
+        None,
+    )
     if not item:
         raise HTTPException(status_code=404, detail="Listing not found")
     acquisition_token = _tracking_token(body.link_token, ctx)
@@ -1165,7 +1195,7 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
         for item in _search(criteria):
             session.add(SavedSearchMatch(
                 search_id=row.id,
-                listing_code=item.get("code") or "",
+                listing_code=item.get("listingToken") or item.get("code") or "",
                 source_fingerprint=item.get("sourceFingerprint") or "",
                 first_seen_at=now,
                 notified_at=now,
@@ -1309,16 +1339,17 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
             # Notify once per listing code. A photo/text/source-fingerprint refresh must
             # not look like a new property. If Telegram delivery fails, keep the match
             # pending and retry on the next catalogue sync instead of silently losing it.
+            item_key = item.get("listingToken") or item.get("code") or ""
             match = session.scalar(select(SavedSearchMatch).where(
                 SavedSearchMatch.search_id == search.id,
-                SavedSearchMatch.listing_code == item.get("code"),
+                SavedSearchMatch.listing_code == item_key,
             ))
             if match and match.notified_at is not None:
                 continue
             if match is None:
                 match = SavedSearchMatch(
                     search_id=search.id,
-                    listing_code=item.get("code") or "",
+                    listing_code=item_key,
                     source_fingerprint=item.get("sourceFingerprint") or "",
                 )
                 session.add(match)
@@ -1352,7 +1383,7 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
                 placement="telegram_notification",
             )
             item_token = str((link or {}).get("token") or "")
-            params = {"listing": str(item.get("code") or "")}
+            params = {"listing": str(item.get("listingToken") or item.get("code") or "")}
             if item_token:
                 params["trk"] = item_token
             url = f"{settings.miniapp_url.rstrip('/')}?{urlencode(params)}"
