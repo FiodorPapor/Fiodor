@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -656,6 +657,20 @@ def _ensure_intent_link(
         return None
 
 
+def _bot_api(method: str, payload: dict[str, Any], timeout: float = 8.0) -> dict[str, Any] | None:
+    try:
+        response = httpx.post(
+            f"https://api.telegram.org/bot{settings.telegram_bot_token}/{method}",
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) and data.get("ok") else None
+    except Exception:
+        return None
+
+
 def _bot_send(chat_id: int | str, text: str, reply_markup: dict[str, Any] | None = None) -> bool:
     try:
         response = httpx.post(
@@ -673,6 +688,68 @@ def _bot_send(chat_id: int | str, text: str, reply_markup: dict[str, Any] | None
         return bool(response.json().get("ok"))
     except Exception:
         return False
+
+
+def _prepared_share_message(
+    user_id: int,
+    item: dict[str, Any],
+    share_target: str,
+) -> str | None:
+    price = f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}".strip()
+    address = str(item.get("address") or item.get("code") or "Объект Le Bleu")
+    details = item.get("details") or {}
+    specs = []
+    if details.get("rooms"):
+        specs.append(f"{details['rooms']} комн.")
+    area = details.get("totalAreaM2") or details.get("coveredAreaM2")
+    if area:
+        specs.append(f"{area} м²")
+    caption = f"<b>{html.escape(address)}</b>\n{html.escape(price)}"
+    if specs:
+        caption += "\n" + html.escape(" · ".join(specs))
+    caption += "\n\nLe Bleu · недвижимость в Аргентине"
+
+    images = item.get("images") or []
+    result_id = hashlib.sha256(
+        f"share|{item.get('listingToken')}|{share_target}".encode()
+    ).hexdigest()[:32]
+    reply_markup = {
+        "inline_keyboard": [[{"text": "Открыть объект", "url": share_target}]]
+    }
+    if images:
+        result: dict[str, Any] = {
+            "type": "photo",
+            "id": result_id,
+            "photo_url": images[0],
+            "thumbnail_url": images[0],
+            "caption": caption,
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup,
+        }
+    else:
+        result = {
+            "type": "article",
+            "id": result_id,
+            "title": address,
+            "description": price,
+            "input_message_content": {
+                "message_text": caption,
+                "parse_mode": "HTML",
+            },
+            "reply_markup": reply_markup,
+        }
+    data = _bot_api(
+        "savePreparedInlineMessage",
+        {
+            "user_id": user_id,
+            "result": result,
+            "allow_user_chats": True,
+            "allow_group_chats": True,
+            "allow_channel_chats": True,
+        },
+    )
+    prepared = (data or {}).get("result") or {}
+    return str(prepared.get("id") or "") or None
 
 
 def _crm_post(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -926,6 +1003,7 @@ def capture_event(body: EventIn):
         "search_started",
         "search_submitted",
         "share_clicked",
+        "share_sent",
         "notification_clicked",
     }
     if body.event_name not in allowed:
@@ -987,12 +1065,14 @@ def action(body: ActionIn):
             f"{item.get('address') or item.get('code')} · "
             f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}"
         ).strip()
+        prepared_message_id = _prepared_share_message(user_id, item, share_target)
         return {
             "ok": True,
             "telegram_url": share_target,
             "share_url": "https://t.me/share/url?" + urlencode(
                 {"url": share_target, "text": share_text}
             ),
+            "prepared_message_id": prepared_message_id,
         }
 
     event_map = {
