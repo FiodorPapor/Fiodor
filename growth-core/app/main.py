@@ -345,6 +345,8 @@ def get_link(token: str, tenant: str = Query("lebleu"), session: Session = Depen
         "placement": row.placement,
         "listing_code": row.listing_code,
         "intent": row.intent,
+        "bot_username": row.bot_username,
+        "telegram_url": f"https://t.me/{row.bot_username}?start=trk_{row.token}",
         "metadata": row.metadata_json,
     }
 
@@ -568,6 +570,8 @@ def acquisition_metrics(
                 "impressions": int(spend["impressions"]),
                 "clicks": clicks,
                 "visitor_to_lead_pct": round(leads / people * 100, 1) if people else None,
+                "start_to_catalog_pct": round(catalog_opens / starts * 100, 1) if starts else None,
+                "catalog_to_lead_pct": round(leads / catalog_opens * 100, 1) if catalog_opens else None,
                 "lead_to_viewing_request_pct": round(viewings / leads * 100, 1) if leads else None,
                 "lead_to_win_pct": round(wins / leads * 100, 1) if leads else None,
                 "visitor_to_win_pct": round(wins / people * 100, 1) if people else None,
@@ -601,10 +605,12 @@ def dashboard(
                 r["people"],
                 r["bot_starts"],
                 r["catalog_opened"],
+                f'{r["start_to_catalog_pct"]}%' if r["start_to_catalog_pct"] is not None else "—",
                 r["listing_opened"],
                 r["search_submitted"],
                 r["share_sent"],
                 r["lead_qualified"],
+                f'{r["catalog_to_lead_pct"]}%' if r["catalog_to_lead_pct"] is not None else "—",
                 f'{r["visitor_to_lead_pct"]}%' if r["visitor_to_lead_pct"] is not None else "—",
                 r["viewing_requested"],
                 r["deal_won"],
@@ -618,7 +624,7 @@ def dashboard(
         )
         + "</tr>"
         for r in data["channels"]
-    ) or '<tr><td colspan="15" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
+    ) or '<tr><td colspan="17" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
     steps = "".join(
         f'<div class="step"><b>{html.escape(s["event"])}</b><span>{s["people"]} чел.</span><small>{s["from_start_pct"] if s["from_start_pct"] is not None else "—"}% от старта</small></div>'
         for s in funnel["steps"]
@@ -652,7 +658,7 @@ th{{color:#6c727f;font-weight:600}}
 <div class="grid">{steps}</div>
 <div class="card">
 <table>
-<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Mini App</th><th>Объекты</th><th>Поиск</th><th>Поделились</th><th>Лиды</th><th>Lead %</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
+<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Mini App</th><th>Start→App %</th><th>Объекты</th><th>Поиск</th><th>Поделились</th><th>Лиды</th><th>App→Lead %</th><th>Total Lead %</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </div>
