@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path("/opt/lebleu-listing-bridge")
 CATALOG = ROOT / "public/data/full/catalog.json"
 PUBLISHER_STATE = ROOT / "state/telegram-state.json"
+GEO_ENRICHMENT = ROOT / "state/geo-enrichment.json"
+SOURCE_FAILURES = ROOT / "public/data/full/failures.json"
 STATE = ROOT / "state/product-health.json"
 ENV = Path("/opt/property-intent-core/.env")
 STALE_SECONDS = 3 * 60 * 60
@@ -85,6 +87,15 @@ def main() -> int:
     if result == "failed":
         issues.append("последний sync завершился failed")
 
+    rc, reconcile_active = cmd("systemctl", "is-active", "property-intent-reconcile.timer")
+    if rc != 0 or reconcile_active != "active":
+        issues.append("CRM reconcile timer не active")
+    _, reconcile_result = cmd(
+        "systemctl", "show", "property-intent-reconcile.service", "--property=Result", "--value"
+    )
+    if reconcile_result == "failed":
+        issues.append("последний CRM reconcile завершился failed")
+
     if not CATALOG.exists():
         issues.append("catalog.json отсутствует")
         catalog_count = 0
@@ -106,6 +117,20 @@ def main() -> int:
     published_count = len(entries) if isinstance(entries, dict) else 0
     if catalog_count and published_count < int(catalog_count * 0.8):
         issues.append(f"Telegram publisher покрывает только {published_count}/{catalog_count}")
+
+    geo_payload = load_json(GEO_ENRICHMENT, {})
+    geo_entries = geo_payload.get("entries", {}) if isinstance(geo_payload, dict) else {}
+    geo_count = len(geo_entries) if isinstance(geo_entries, dict) else 0
+    if catalog_count and geo_count < int(catalog_count * 0.8):
+        issues.append(f"геообогащение покрывает только {geo_count}/{catalog_count}")
+    if GEO_ENRICHMENT.exists() and now - GEO_ENRICHMENT.stat().st_mtime > 12 * 60 * 60:
+        issues.append("геообогащение не обновлялось более 12 ч")
+
+    source_failures = load_json(SOURCE_FAILURES, [])
+    source_failure_count = len(source_failures) if isinstance(source_failures, list) else 0
+    # One known broken upstream detail URL should not page the operator.
+    if source_failure_count > max(5, int(max(catalog_count, 1) * 0.05)):
+        issues.append(f"слишком много upstream failures: {source_failure_count}")
 
     endpoints = {
         "Property Intent": "http://127.0.0.1:8050/health",
@@ -140,6 +165,8 @@ def main() -> int:
         "issues": issues,
         "catalog_count": catalog_count,
         "publisher_count": published_count,
+        "geo_count": geo_count,
+        "source_failure_count": source_failure_count,
         "last_good_catalog_count": (
             last_good_count
             if any(x.startswith("резкое падение inventory") for x in issues)
