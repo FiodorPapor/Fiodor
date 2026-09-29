@@ -41,6 +41,12 @@ def request(path: str, *, method: str = "GET", payload=None):
         return json.load(response)
 
 
+def fetch_json(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": "Revenue-Radar-Preflight/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        return json.load(response)
+
+
 def cmd_link(args):
     payload = {
         "tenant": args.tenant,
@@ -102,7 +108,7 @@ def cmd_report(args):
     if not rows:
         print(f"{args.tenant}: no production events/spend in last {args.days} days")
         return
-    headers = ["source", "medium", "campaign", "people", "app", "app%", "shared", "leads", "lead%", "view", "wins", "spend", "CPL"]
+    headers = ["source", "medium", "campaign", "people", "starts", "app", "start→app%", "shared", "leads", "app→lead%", "view", "wins", "spend", "CPL"]
     out = []
     for row in rows:
         spend = ",".join(f"{k} {v:g}" for k, v in row["spend"].items()) or "—"
@@ -116,8 +122,9 @@ def cmd_report(args):
         app_pct = round(app_opens / starts * 100, 1) if starts else None
         out.append([
             row["source"], row["medium"], row["campaign"], row["people"],
-            app_opens, fmt_num(app_pct), row.get("share_sent", 0),
-            row["lead_qualified"], fmt_num(row["visitor_to_lead_pct"]),
+            starts, app_opens, fmt_num(row.get("start_to_catalog_pct", app_pct)),
+            row.get("share_sent", 0),
+            row["lead_qualified"], fmt_num(row.get("catalog_to_lead_pct")),
             row["viewing_requested"], row["deal_won"], spend, cpl,
         ])
     widths = [len(h) for h in headers]
@@ -144,6 +151,75 @@ def cmd_funnel(args):
             f"{step['event']}: {step['people']} people "
             f"({fmt_num(step['from_start_pct'])}% from start)"
         )
+
+
+def cmd_preflight(args):
+    link = request(
+        f"/v1/links/{urllib.parse.quote(args.token)}?"
+        + urllib.parse.urlencode({"tenant": args.tenant})
+    )
+    checks: list[tuple[str, bool, str]] = []
+
+    def add(name: str, ok: bool, detail: str):
+        checks.append((name, ok, detail))
+
+    add("tracking", bool(link.get("source") and link.get("campaign")), f"{link.get('source')} / {link.get('campaign')}")
+    add("deep_link", f"start=trk_{args.token}" in str(link.get("telegram_url") or ""), str(link.get("telegram_url") or "missing"))
+    add("bot", bool(link.get("bot_username")), str(link.get("bot_username") or "missing"))
+
+    service_urls = [
+        ("intent", args.intent_health),
+        ("crm", args.crm_health),
+    ]
+    for name, url in service_urls:
+        try:
+            data = fetch_json(url)
+            add(name, str(data.get("status") or "").lower() == "ok", str(data.get("status") or data))
+        except Exception as exc:
+            add(name, False, f"{type(exc).__name__}: {exc}")
+
+    try:
+        catalog = fetch_json(args.catalog_url)
+        count = int(catalog.get("count") or 0)
+        add("catalog", count > 0, f"{count} objects")
+    except Exception as exc:
+        add("catalog", False, f"{type(exc).__name__}: {exc}")
+
+    metrics = request(
+        "/v1/metrics/acquisition?"
+        + urllib.parse.urlencode(
+            {"tenant": args.tenant, "days": args.days, "include_test": "false"}
+        )
+    )
+    matching = [
+        row
+        for row in metrics.get("channels", [])
+        if row.get("source") == link.get("source")
+        and row.get("medium") == link.get("medium")
+        and row.get("campaign") == link.get("campaign")
+    ]
+    production_people = sum(int(row.get("people") or 0) for row in matching)
+    production_spend = sum(
+        float(amount or 0)
+        for row in matching
+        for amount in (row.get("spend") or {}).values()
+    )
+    clean = production_people == 0 and production_spend == 0
+    add(
+        "baseline",
+        clean or not args.require_clean,
+        f"people={production_people}, spend={production_spend:g}",
+    )
+
+    metadata = link.get("metadata") or {}
+    if metadata:
+        print("metadata=" + json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+    for name, ok, detail in checks:
+        print(f"{'OK' if ok else 'FAIL'}  {name:<10} {detail}")
+    ready = all(ok for _, ok, _ in checks)
+    print("READY" if ready else "NOT_READY")
+    if not ready:
+        raise SystemExit(2)
 
 
 def build_parser():
@@ -188,6 +264,15 @@ def build_parser():
     funnel.add_argument("--campaign")
     funnel.add_argument("--include-test", action="store_true")
     funnel.set_defaults(func=cmd_funnel)
+
+    preflight = sub.add_parser("preflight", help="Verify a tracked acquisition campaign before launch")
+    preflight.add_argument("--token", required=True)
+    preflight.add_argument("--days", type=int, default=30)
+    preflight.add_argument("--require-clean", action="store_true")
+    preflight.add_argument("--intent-health", default="http://127.0.0.1:8050/health")
+    preflight.add_argument("--crm-health", default="http://127.0.0.1:8020/health")
+    preflight.add_argument("--catalog-url", default="https://lebleu-app.srv1636153.hstgr.cloud/api/v1/catalog")
+    preflight.set_defaults(func=cmd_preflight)
     return p
 
 
