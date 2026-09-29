@@ -13,6 +13,7 @@ type Listing = {
   images:string[]; photoCount:number; sourceUrl:string; neighborhoods:string[]; listingToken:string;
 };
 type Catalog = {count:number; operations:Record<string,number>; neighborhoods:string[]; items:Listing[]};
+type PublicConfig = {brandName:string; brandTagline:string; botUsername:string};
 type Filters = {
   operation:string; query:string; neighborhoods:string[]; propertyTypes:string[];
   rooms:number|null; maxBudget:string; budgetCurrency:string;
@@ -89,6 +90,9 @@ function canSaveSearch(f:Filters){
 function normalizedSearch(value:string){
   return value.toLowerCase().replace(/ё/g,'е').replace(/[^a-záéíóúñüа-я0-9]+/gi,' ').trim();
 }
+function listingKey(item:Listing){
+  return item.listingToken||item.code;
+}
 async function ensureWriteAccess(){
   if(!tg) return false;
   if(tg.initDataUnsafe?.user?.allows_write_to_pm) return true;
@@ -102,8 +106,14 @@ async function ensureWriteAccess(){
 const DEFAULT_FILTERS:Filters={
   operation:'',query:'',neighborhoods:[],propertyTypes:[],rooms:null,maxBudget:'',budgetCurrency:'USD'
 };
+const DEFAULT_CONFIG:PublicConfig={brandName:'Каталог',brandTagline:'Недвижимость',botUsername:''};
+function brandInitials(name:string){
+  const parts=name.trim().split(/\s+/).filter(Boolean);
+  return (parts.length>1?parts.slice(0,2).map(x=>x[0]).join(''):name.slice(0,2)).toUpperCase()||'RE';
+}
 
 function App(){
+  const [config,setConfig]=useState<PublicConfig>(DEFAULT_CONFIG);
   const [catalog,setCatalog]=useState<Catalog|null>(null);
   const [filters,setFilters]=useState<Filters>(DEFAULT_FILTERS);
   const [selected,setSelected]=useState<Listing|null>(null);
@@ -126,11 +136,16 @@ function App(){
         tg.enableVerticalSwipes?.();
       }catch{}
     }
+    api<PublicConfig>('/api/v1/config').then(data=>{
+      setConfig(data);
+      document.title=data.brandTagline?(data.brandName+' · '+data.brandTagline):data.brandName;
+      document.querySelector('meta[name="description"]')?.setAttribute('content','Каталог недвижимости · '+data.brandName);
+    }).catch(()=>{});
     api<Catalog>('/api/v1/catalog').then(data=>{
       setCatalog(data);
       if(initData) event('catalog_opened');
       if(requestedListing){
-        const item=data.items.find(x=>x.code===requestedListing);
+        const item=data.items.find(x=>listingKey(x)===requestedListing||x.code===requestedListing);
         if(item) openListing(item);
       }else if(requestedSavedSearch&&initData){
         restoreSavedSearch(requestedSavedSearch);
@@ -169,7 +184,7 @@ function App(){
     if(!initData) return;
     try{
       await api('/api/v1/events',{method:'POST',body:JSON.stringify({
-        init_data:initData,event_name:name,listing_code:listing?.code,properties,
+        init_data:initData,event_name:name,listing_code:listing?listingKey(listing):undefined,properties,
         link_token:trackingToken||undefined
       })});
     }catch{}
@@ -226,8 +241,9 @@ function App(){
     setSelected(item);
     event('listing_opened',item);
     try{
-      const full=await api<Listing>(`/api/v1/catalog/${encodeURIComponent(item.code)}`);
-      setSelected(current=>current?.code===item.code?full:current);
+      const key=listingKey(item);
+      const full=await api<Listing>(`/api/v1/catalog/${encodeURIComponent(key)}`);
+      setSelected(current=>current&&listingKey(current)===key?full:current);
     }catch(err:any){
       showToast(err.message||'Не удалось загрузить детали');
     }
@@ -239,7 +255,7 @@ function App(){
     try{
       const res=await api<{telegram_url:string;share_url?:string;prepared_message_id?:string}>('/api/v1/actions',{
         method:'POST',body:JSON.stringify({
-          init_data:initData,listing_code:selected.code,action,link_token:trackingToken||undefined
+          init_data:initData,listing_code:listingKey(selected),action,link_token:trackingToken||undefined
         })
       });
       if(action==='share'&&res.prepared_message_id&&typeof tg?.shareMessage==='function'){
@@ -311,19 +327,19 @@ function App(){
   }
 
   if(!catalog){
-    return <div className="loading"><div className="spinner"/><span>Загружаем каталог Le Bleu</span></div>;
+    return <div className="loading"><div className="spinner"/><span>Загружаем каталог {config.brandName}</span></div>;
   }
 
   if(selected){
-    return <ListingDetail item={selected} busy={busy} onBack={()=>setSelected(null)}
+    return <ListingDetail item={selected} busy={busy} brandName={config.brandName} onBack={()=>setSelected(null)}
       onAction={listingAction} onGallery={()=>event('gallery_opened',selected)} />;
   }
 
   return <div className="app">
     <header className="topbar">
       <div className="brand">
-        <div className="brandMark">LB</div>
-        <div><strong>Le Bleu</strong><span>Недвижимость в Аргентине</span></div>
+        <div className="brandMark">{brandInitials(config.brandName)}</div>
+        <div><strong>{config.brandName}</strong><span>{config.brandTagline||'Недвижимость'}</span></div>
       </div>
       {initData&&<button className="iconBtn" onClick={()=>setSavedOpen(true)} aria-label="Мои поиски"><Bookmark size={20}/></button>}
     </header>
@@ -381,7 +397,7 @@ function App(){
       count={results.length} onClose={()=>setFiltersOpen(false)} onUpdate={update} onToggleHood={toggleNeighborhood} onToggleType={toggleType}/>}
 
     {saveOpen&&<SaveSheet notify={notify} setNotify={setNotify} count={results.length} busy={busy}
-      authenticated={!!initData} onClose={()=>setSaveOpen(false)} onSave={saveSearch}/>}
+      authenticated={!!initData} botUsername={config.botUsername} onClose={()=>setSaveOpen(false)} onSave={saveSearch}/>}
 
     {savedOpen&&<SavedSheet items={saved} onClose={()=>setSavedOpen(false)} onDelete={removeSaved}/>}
 
@@ -405,7 +421,7 @@ function ListingCard({item,onOpen}:{item:Listing;onOpen:()=>void}){
   </button>;
 }
 
-function ListingDetail({item,busy,onBack,onAction,onGallery}:{item:Listing;busy:boolean;onBack:()=>void;onAction:(x:string)=>void;onGallery:()=>void}){
+function ListingDetail({item,busy,brandName,onBack,onAction,onGallery}:{item:Listing;busy:boolean;brandName:string;onBack:()=>void;onAction:(x:string)=>void;onGallery:()=>void}){
   const [photo,setPhoto]=useState(0);
   return <div className="detail">
     <div className="detailNav">
@@ -445,7 +461,7 @@ function ListingDetail({item,busy,onBack,onAction,onGallery}:{item:Listing;busy:
         <button onClick={()=>onAction('similar')} disabled={busy}><Search size={17}/> Подобрать похожие</button>
       </div>
       <button className="sourceLink" onClick={()=>tg?.openLink?tg.openLink(item.sourceUrl):window.open(item.sourceUrl,'_blank')}>
-        Оригинал на Le Bleu <ChevronRight size={17}/>
+        Оригинал на {brandName} <ChevronRight size={17}/>
       </button>
     </div>
     <div className="detailActions">
@@ -479,7 +495,7 @@ function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate
   </div>;
 }
 
-function SaveSheet({notify,setNotify,count,busy,authenticated,onClose,onSave}:any){
+function SaveSheet({notify,setNotify,count,busy,authenticated,botUsername,onClose,onSave}:any){
   return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
     <div className="sheet">
       <div className="sheetHandle"/><div className="sheetHead"><div><span>Сохранить поиск</span><strong>{count} сейчас</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
@@ -488,7 +504,7 @@ function SaveSheet({notify,setNotify,count,busy,authenticated,onClose,onSave}:an
         <div><Bell size={20}/><span><strong>Сообщать о новых вариантах</strong><small>Только когда появится новый подходящий объект</small></span></div>
         <input type="checkbox" checked={notify} onChange={e=>setNotify(e.target.checked)}/><i/>
       </label>
-      {!authenticated&&<div className="authNote">Сохранение и уведомления работают, когда каталог открыт из @LeBleuArgentinaBot.</div>}
+      {!authenticated&&<div className="authNote">Сохранение и уведомления работают, когда каталог открыт из {botUsername?'@'+botUsername:'Telegram-бота агентства'}.</div>}
       <button className="primary full" disabled={busy||!authenticated} onClick={onSave}>{busy?'Сохраняем…':'Сохранить поиск'}</button>
     </div>
   </div>;
