@@ -27,6 +27,7 @@ BOT_CHAT_ID = os.environ.get("RADAR_ALERT_CHAT_ID") or os.environ.get("RADAR_BOT
 OPP_DB_PATH = os.environ.get("RR_OPPORTUNITY_DB", "/opt/intent-radar/data/opportunities.sqlite3")
 BROAD_DB_PATH = os.environ.get("RR_BROAD_DB", "/opt/intent-radar/data/broad_radar.sqlite3")
 DYNAMIC_SOURCES_PATH = Path("/opt/intent-radar/data/dynamic_public_sources.json")
+COMMERCIAL_PLACEMENTS_PATH = Path("/opt/intent-radar/data/commercial_placements.json")
 LEGACY_ALERTS = os.environ.get("RADAR_LEGACY_ALERTS", "0") == "1"
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
@@ -117,10 +118,61 @@ async def send_operator_alert(text, link="", copy_text=""):
     await client.send_message("me", text, link_preview=False)
 
 
+def _commercial_placement_state():
+    try:
+        data = json.loads(COMMERCIAL_PLACEMENTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"seen": {}}
+    except Exception:
+        return {"seen": {}}
+
+
+async def detect_commercial_placement(chat, chat_id, message_id, text, date):
+    username = str(getattr(chat, "username", "") or "").lower().lstrip("@")
+    if not username or not text:
+        return False
+    for watch in CFG.get("commercial_campaign_watch", []):
+        target = str(watch.get("chat_username") or "").lower().lstrip("@")
+        token = str(watch.get("token") or "")
+        if not target or not token or username != target or token not in text:
+            continue
+        key = f"{chat_id}:{message_id}:{token}"
+        state = _commercial_placement_state()
+        seen = state.setdefault("seen", {})
+        if key in seen:
+            return True
+        occurred = (date or datetime.now(timezone.utc)).isoformat()
+        link = message_link(chat, chat_id, message_id)
+        seen[key] = {
+            "campaign": watch.get("campaign"),
+            "chat_username": username,
+            "token": token,
+            "message_id": int(message_id),
+            "occurred_at": occurred,
+            "link": link,
+        }
+        COMMERCIAL_PLACEMENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        COMMERCIAL_PLACEMENTS_PATH.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        await send_operator_alert(
+            "🚀 Размещение Le Bleu обнаружено\n"
+            f"Кампания: {watch.get('campaign') or token}\n"
+            f"Канал: @{username}\n"
+            f"Опубликовано: {occurred}\n"
+            "Growth attribution уже привязан к этой ссылке. "
+            "Расход записывай только после подтверждённой оплаты.",
+            link,
+        )
+        return True
+    return False
+
+
 client = TelegramClient(SESSION, API_ID, API_HASH)
 
 
 async def process_candidate(chat, chat_id, message_id, text, date, sender):
+    await detect_commercial_placement(chat, chat_id, message_id, text, date)
     if not isinstance(sender, User) or getattr(sender, "bot", False):
         return
     chat_title = getattr(chat, "title", "Telegram group")
