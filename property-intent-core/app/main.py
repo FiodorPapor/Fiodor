@@ -781,6 +781,8 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
     )))
     notifications = 0
     new_matches = 0
+    delivery_attempts = 0
+    delivery_failures = 0
     for search in searches:
         pending: list[tuple[dict[str, Any], SavedSearchMatch]] = []
         for item in _search(search.criteria_json):
@@ -824,6 +826,7 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
         if len(pending) > 3:
             lines.append(f"\nИ ещё {len(pending) - 3} новых.")
         keyboard.append([{"text": "Открыть каталог", "web_app": {"url": settings.miniapp_url}}])
+        delivery_attempts += 1
         sent = _bot_send(search.telegram_user_id, "\n".join(lines), {"inline_keyboard": keyboard})
         now = datetime.now(UTC)
         if sent:
@@ -836,5 +839,14 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
                 "notification_sent",
                 properties={"saved_search_id": str(search.id), "new_matches": len(pending)},
             )
+        else:
+            delivery_failures += 1
     session.commit()
-    return {"ok": True, "active_searches": len(searches), "new_matches": new_matches, "notifications": notifications}
+    return {
+        "ok": True,
+        "active_searches": len(searches),
+        "new_matches": new_matches,
+        "notifications": notifications,
+        "delivery_attempts": delivery_attempts,
+        "delivery_failures": delivery_failures,
+    }
