@@ -17,7 +17,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, create_engine, select, text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, UniqueConstraint, create_engine, select, text
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     miniapp_url: str = "https://lebleu-app.srv1636153.hstgr.cloud"
     crm_base_url: str = ""
     crm_api_key: str = ""
+    crm_webhook_url: str = ""
+    crm_webhook_secret: str = ""
     catalog_path: str = "/data/catalog.json"
     quality_path: str = "/data/quality.json"
     geo_enrichment_path: str = "/data/geo-enrichment.json"
@@ -77,6 +79,8 @@ class SavedSearch(Base):
     last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     crm_contact_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     crm_opportunity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    crm_webhook_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    crm_webhook_attempts: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SavedSearchMatch(Base):
@@ -736,6 +740,80 @@ def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: 
             row.crm_opportunity_id = str(opportunity["id"])
 
 
+def _saved_search_webhook_payload(
+    row: SavedSearch,
+    user: dict[str, Any],
+    matches_now: int,
+) -> dict[str, Any]:
+    attribution = _growth_link(row.tracking_token) or {}
+    display_name = " ".join(
+        part for part in [user.get("first_name"), user.get("last_name")] if part
+    ) or user.get("username") or row.display_name or f"Telegram {row.telegram_user_id}"
+    return {
+        "schema_version": "1.0",
+        "event": "lead.saved_search",
+        "tenant": settings.growth_tenant,
+        "idempotency_key": f"saved_search:{row.id}",
+        "occurred_at": row.created_at.isoformat(),
+        "contact": {
+            "channel": "telegram",
+            "external_id": str(row.telegram_user_id),
+            "username": user.get("username") or row.username,
+            "display_name": display_name,
+            "language": "ru",
+        },
+        "lead": {
+            "external_id": str(row.id),
+            "type": "property_saved_search",
+            "label": row.label,
+            "criteria": row.criteria_json,
+            "notification_opt_in": row.notify,
+            "matches_now": matches_now,
+        },
+        "attribution": {
+            "token": row.tracking_token,
+            "source": attribution.get("source"),
+            "medium": attribution.get("medium"),
+            "campaign": attribution.get("campaign"),
+            "content": attribution.get("content"),
+            "placement": attribution.get("placement"),
+        },
+    }
+
+
+def _crm_webhook_sync(row: SavedSearch, user: dict[str, Any], matches_now: int) -> bool | None:
+    url = settings.crm_webhook_url.strip()
+    secret = settings.crm_webhook_secret
+    if not url or not secret:
+        return None
+    payload = _saved_search_webhook_payload(row, user, matches_now)
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    row.crm_webhook_attempts = int(row.crm_webhook_attempts or 0) + 1
+    try:
+        response = httpx.post(
+            url,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Revenue-Event": "lead.saved_search",
+                "X-Revenue-Signature": f"sha256={signature}",
+                "Idempotency-Key": payload["idempotency_key"],
+            },
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        row.crm_webhook_delivered_at = datetime.now(UTC)
+        return True
+    except Exception:
+        return False
+
+
 def _label(criteria: dict[str, Any]) -> str:
     bits = []
     if criteria.get("operation"):
@@ -767,6 +845,8 @@ def startup():
         conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_contact_id VARCHAR(80)"))
         conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_opportunity_id VARCHAR(80)"))
         conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(24)"))
+        conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_webhook_delivered_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_webhook_attempts INTEGER NOT NULL DEFAULT 0"))
 
 
 @app.get("/health")
@@ -974,6 +1054,8 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
     session.flush()
     if not _is_test_user(user_id):
         _crm_sync_saved_search(row, user, matches_now)
+        if row.crm_webhook_delivered_at is None:
+            _crm_webhook_sync(row, user, matches_now)
     session.commit()
     _growth_event(
         user_id,
@@ -1021,6 +1103,64 @@ def disable_search(search_id: UUID, init_data: str = Query(...), session: Sessio
     row.updated_at = datetime.now(UTC)
     session.commit()
     return {"ok": True}
+
+
+@app.post("/v1/internal/reconcile-integrations")
+def reconcile_integrations(
+    x_intent_key: str | None = Header(default=None),
+    session: Session = Depends(db),
+):
+    if not x_intent_key or not hmac.compare_digest(x_intent_key, settings.service_key):
+        raise HTTPException(status_code=401, detail="Invalid intent key")
+    rows = list(session.scalars(
+        select(SavedSearch)
+        .where(SavedSearch.tenant == settings.growth_tenant)
+        .order_by(SavedSearch.created_at.asc())
+        .limit(200)
+    ))
+    attempted = 0
+    delivered = 0
+    failed = 0
+    for row in rows:
+        if _is_test_user(row.telegram_user_id):
+            continue
+        needs_direct = bool(
+            settings.crm_base_url
+            and settings.crm_api_key
+            and not row.crm_opportunity_id
+        )
+        needs_webhook = bool(
+            settings.crm_webhook_url
+            and settings.crm_webhook_secret
+            and row.crm_webhook_delivered_at is None
+        )
+        if not needs_direct and not needs_webhook:
+            continue
+        attempted += 1
+        user = {
+            "id": row.telegram_user_id,
+            "username": row.username,
+            "first_name": row.display_name,
+        }
+        matches_now = len(_search(row.criteria_json))
+        if needs_direct:
+            _crm_sync_saved_search(row, user, matches_now)
+        webhook_ok: bool | None = None
+        if needs_webhook:
+            webhook_ok = _crm_webhook_sync(row, user, matches_now)
+        direct_ok = (not needs_direct) or bool(row.crm_opportunity_id)
+        webhook_done = (not needs_webhook) or webhook_ok is True
+        if direct_ok and webhook_done:
+            delivered += 1
+        else:
+            failed += 1
+    session.commit()
+    return {
+        "ok": True,
+        "attempted": attempted,
+        "delivered": delivered,
+        "failed": failed,
+    }
 
 
 @app.post("/v1/internal/rematch")
