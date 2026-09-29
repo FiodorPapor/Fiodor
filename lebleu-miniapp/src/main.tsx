@@ -2,7 +2,7 @@ import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {
   ArrowLeft, Bell, Bookmark, Building2, Check, ChevronRight,
-  MapPin, MessageCircle, Search, SlidersHorizontal, X
+  MapPin, MessageCircle, Search, Share2, SlidersHorizontal, X
 } from 'lucide-react';
 import './styles.css';
 
@@ -228,14 +228,15 @@ function App(){
     if(!initData){showToast('Откройте каталог внутри Telegram');return;}
     setBusy(true);
     try{
-      const res=await api<{telegram_url:string}>('/api/v1/actions',{
+      const res=await api<{telegram_url:string;share_url?:string}>('/api/v1/actions',{
         method:'POST',body:JSON.stringify({
           init_data:initData,listing_code:selected.code,action,link_token:trackingToken||undefined
         })
       });
       haptic('success');
-      if(tg?.openTelegramLink) tg.openTelegramLink(res.telegram_url);
-      else window.location.href=res.telegram_url;
+      const destination=action==='share'&&res.share_url?res.share_url:res.telegram_url;
+      if(tg?.openTelegramLink) tg.openTelegramLink(destination);
+      else window.location.href=destination;
     }catch(err:any){showToast(err.message||'Не удалось открыть чат');}
     finally{setBusy(false);}
   }
@@ -384,7 +385,7 @@ function ListingDetail({item,busy,onBack,onAction,onGallery}:{item:Listing;busy:
     <div className="detailNav">
       <button className="roundBtn" onClick={onBack}><ArrowLeft size={21}/></button>
       <div className="detailCode">{item.code}</div>
-      <div className="navSpacer"/>
+      <button className="roundBtn" disabled={busy} onClick={()=>onAction('share')} aria-label="Поделиться объектом"><Share2 size={19}/></button>
     </div>
     <div className="gallery" onClick={onGallery}>
       <div className="galleryTrack" onScroll={e=>{
