@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /opt/property-intent-core
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 LOG=/tmp/property-intent-deploy.$$.log
 cleanup(){ rm -f "$LOG"; }
 trap cleanup EXIT
+
+env_value() {
+  local key="$1" default="$2" value
+  value="$(grep -E "^${key}=" .env 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+  printf '%s' "${value:-$default}"
+}
+HOST_PORT="$(env_value HOST_PORT 8050)"
+CONTAINER_PREFIX="$(env_value CONTAINER_PREFIX property-intent)"
+
 python3 -m py_compile app/main.py
 if ! timeout 120s docker compose build api >"$LOG" 2>&1; then
   tail -80 "$LOG" >&2
@@ -11,14 +21,14 @@ if ! timeout 120s docker compose build api >"$LOG" 2>&1; then
 fi
 docker compose up -d api >>"$LOG" 2>&1
 for _ in $(seq 1 30); do
-  if curl -fsS --max-time 2 http://127.0.0.1:8050/health >/dev/null 2>&1; then
+  if curl -fsS --max-time 2 "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
     python3 - <<'PY'
 import json
 import urllib.request
 from pathlib import Path
 
 env={}
-for raw in Path("/opt/property-intent-core/.env").read_text().splitlines():
+for raw in Path(".env").read_text().splitlines():
     line=raw.strip()
     if not line or line.startswith("#") or "=" not in line:
         continue
@@ -26,11 +36,12 @@ for raw in Path("/opt/property-intent-core/.env").read_text().splitlines():
     env[key]=value.strip().strip('"').strip("'")
 token=env.get("TELEGRAM_BOT_TOKEN","")
 url=env.get("MINIAPP_URL","")
+menu_text=env.get("MENU_BUTTON_TEXT","Каталог")
 if token and url:
     payload=json.dumps({
         "menu_button":{
             "type":"web_app",
-            "text":"Каталог",
+            "text":menu_text,
             "web_app":{"url":url}
         }
     }).encode()
@@ -50,5 +61,5 @@ PY
   sleep 1
 done
 docker compose ps >&2
-docker logs --tail 80 property-intent-api >&2 || true
+docker logs --tail 80 "${CONTAINER_PREFIX}-api" >&2 || true
 exit 1
