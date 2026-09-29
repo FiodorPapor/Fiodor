@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, time, urllib.request, urllib.parse, urllib.error, subprocess, re, threading
+import hashlib, json, os, time, urllib.request, urllib.parse, urllib.error, subprocess, re, threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
@@ -201,16 +201,86 @@ def _reply_flags(row):
     ))
     return text, rental_friction, direct_only, research
 
-def catalog_public_template():
+def _growth_outreach_link(row, surface):
+    if row is None:
+        return LEBLEU_CATALOG_URL
+    try:
+        placement_id = row["chat_id"] if surface == "public" else (row["sender_id"] or row["sender_username"] or row["id"])
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/growthctl", "link",
+                "--source", "revenue_radar",
+                "--medium", "manual_outreach",
+                "--campaign", "radar_catalog_reply",
+                "--content", f"candidate_{row['id']}",
+                "--placement", f"{surface}:{placement_id}",
+                "--intent", "miniapp",
+                "--note", f"candidate={row['id']} category={row['category']} surface={surface}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        first = (proc.stdout or "").strip().splitlines()
+        if proc.returncode == 0 and first and first[0].startswith("https://t.me/"):
+            return first[0]
+    except Exception as exc:
+        print(f"Growth outreach link failed: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+    return LEBLEU_CATALOG_URL
+
+
+def _listing_token(item):
+    code = str(item.get("code") or "").strip()
+    source = str(item.get("sourceUrl") or "")
+    if not code or not source:
+        return None
+    return f"{code}_{hashlib.sha256(source.encode()).hexdigest()[:8]}"
+
+
+def _growth_listing_outreach_link(row, item, surface="dm"):
+    token = _listing_token(item)
+    if row is None or not token:
+        return None
+    try:
+        placement_id = row["chat_id"] if surface == "public" else (row["sender_id"] or row["sender_username"] or row["id"])
+        proc = subprocess.run(
+            [
+                "/usr/local/bin/growthctl", "link",
+                "--source", "revenue_radar",
+                "--medium", "manual_outreach",
+                "--campaign", "radar_listing_match",
+                "--content", f"candidate_{row['id']}",
+                "--placement", f"{surface}:{placement_id}",
+                "--listing", token,
+                "--intent", "listing",
+                "--note", f"candidate={row['id']} listing={token} category={row['category']} surface={surface}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        first = (proc.stdout or "").strip().splitlines()
+        if proc.returncode == 0 and first and first[0].startswith("https://t.me/"):
+            return first[0]
+    except Exception as exc:
+        print(f"Growth listing link failed: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+    return None
+
+
+def catalog_public_template(row=None):
+    catalog_url = _growth_outreach_link(row, "public")
     return (
-        f"Если запрос ещё актуален, вот каталог Le Bleu с текущими объектами: {LEBLEU_CATALOG_URL}\n\n"
+        f"Если запрос ещё актуален, вот каталог Le Bleu с текущими объектами: {catalog_url}\n\n"
         f"Если там ничего подходящего нет, напишите мне в личку {FIODOR_TELEGRAM} и коротко опишите, "
         "что ищете. Посмотрю ваш запрос отдельно."
     )
 
-def catalog_dm_template():
+def catalog_dm_template(row=None):
+    catalog_url = _growth_outreach_link(row, "dm")
     return (
-        f"Привет! Увидел ваш запрос. Вот каталог Le Bleu с текущими объектами: {LEBLEU_CATALOG_URL}\n\n"
+        f"Привет! Увидел ваш запрос. Вот каталог Le Bleu с текущими объектами: {catalog_url}\n\n"
         "Если там ничего подходящего нет, напишите, что ищете: аренда или покупка, район, бюджет и основные пожелания. "
         "Посмотрю ваш запрос отдельно."
     )
@@ -220,8 +290,8 @@ def send_catalog_reply_kit(row=None):
         send((outreach_read_only_note(row) or "⚠️ Для этого чата отключён коммерческий outreach.") +
              "\n\nКаталог-шаблон для исходной группы здесь не предлагаю. Сначала нужно согласовать рекламу/экспертное размещение с администраторами чата.")
         return
-    public = catalog_public_template()
-    dm = catalog_dm_template()
+    public = catalog_public_template(row)
+    dm = catalog_dm_template(row)
     buttons = []
     if row is not None:
         buttons.append([{"text":"💬 Черновик в группе","callback_data":f"catalogdraft:{row['id']}"}])
@@ -329,7 +399,7 @@ def send_reply_kit(row, result=None, post_url=None):
         send("🔎 Здесь не стоит отвечать шаблоном: тема требует проверки актуальных фактов.\n\n" + prompt, buttons)
         return
     public = draft_public(dict(row), result) if result else generic_public(row)
-    dm = draft_dm(dict(row), result, post_url) if result else generic_dm(row)
+    dm = draft_dm(dict(row), result, _growth_listing_outreach_link(row, result["item"], "dm")) if result else generic_dm(row)
     if outreach_read_only(row):
         # Do not help bypass a community restriction by switching to unsolicited DM.
         # Keep only a neutral, non-commercial public answer for manual review.
@@ -725,7 +795,7 @@ def handle_callback(con, cq, acknowledged=False):
             ack("Групповой outreach отключён")
             send(outreach_read_only_note(row) or "⚠️ Для этого чата групповой outreach отключён.")
             return
-        job_id = queue_reply_draft(row, catalog_public_template())
+        job_id = queue_reply_draft(row, catalog_public_template(row))
         ack("Сохраняю черновик в исходном чате…")
         job = wait_reply_draft(job_id, 6)
         if job and job["status"] == "DONE":
