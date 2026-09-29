@@ -102,7 +102,7 @@ def cmd_report(args):
     if not rows:
         print(f"{args.tenant}: no production events/spend in last {args.days} days")
         return
-    headers = ["source", "medium", "campaign", "people", "leads", "lead%", "view", "wins", "spend", "CPL"]
+    headers = ["source", "medium", "campaign", "people", "shared", "leads", "lead%", "view", "wins", "spend", "CPL"]
     out = []
     for row in rows:
         spend = ",".join(f"{k} {v:g}" for k, v in row["spend"].items()) or "—"
@@ -113,7 +113,7 @@ def cmd_report(args):
         )
         out.append([
             row["source"], row["medium"], row["campaign"], row["people"],
-            row["lead_qualified"], fmt_num(row["visitor_to_lead_pct"]),
+            row.get("share_sent", 0), row["lead_qualified"], fmt_num(row["visitor_to_lead_pct"]),
             row["viewing_requested"], row["deal_won"], spend, cpl,
         ])
     widths = [len(h) for h in headers]
