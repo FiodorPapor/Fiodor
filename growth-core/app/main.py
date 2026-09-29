@@ -469,15 +469,15 @@ def acquisition_metrics(
             func.coalesce(Event.medium, "unknown"),
             func.coalesce(Event.campaign, "unknown"),
             func.count(func.distinct(Event.actor_key)),
-            func.count(Event.id).filter(Event.event_name == "bot_started"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "bot_started"),
             func.count(Event.id).filter(Event.event_name == "listing_opened"),
-            func.count(Event.id).filter(Event.event_name == "search_submitted"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "search_submitted"),
             func.count(Event.id).filter(Event.event_name == "share_clicked"),
             func.count(Event.id).filter(Event.event_name == "share_sent"),
-            func.count(Event.id).filter(Event.event_name == "availability_requested"),
-            func.count(Event.id).filter(Event.event_name == "viewing_requested"),
-            func.count(Event.id).filter(Event.event_name == "lead_qualified"),
-            func.count(Event.id).filter(Event.event_name == "deal_won"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "availability_requested"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "viewing_requested"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "lead_qualified"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "deal_won"),
         )
         .where(*conditions)
         .group_by(Event.source, Event.medium, Event.campaign)
