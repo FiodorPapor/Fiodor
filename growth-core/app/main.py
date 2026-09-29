@@ -541,9 +541,11 @@ def acquisition_metrics(
         currencies = spend["by_currency"]
         unit_currency = next(iter(currencies)) if len(currencies) == 1 else None
         amount = currencies.get(unit_currency, 0.0) if unit_currency else None
+        people = metrics["people"]
         leads = metrics["lead_qualified"]
         viewings = metrics["viewing_requested"]
         wins = metrics["deal_won"]
+        clicks = int(spend["clicks"])
         out.append(
             {
                 "source": source,
@@ -552,7 +554,13 @@ def acquisition_metrics(
                 **metrics,
                 "spend": currencies,
                 "impressions": int(spend["impressions"]),
-                "clicks": int(spend["clicks"]),
+                "clicks": clicks,
+                "visitor_to_lead_pct": round(leads / people * 100, 1) if people else None,
+                "lead_to_viewing_request_pct": round(viewings / leads * 100, 1) if leads else None,
+                "lead_to_win_pct": round(wins / leads * 100, 1) if leads else None,
+                "visitor_to_win_pct": round(wins / people * 100, 1) if people else None,
+                "click_to_lead_pct": round(leads / clicks * 100, 1) if clicks else None,
+                "cost_per_person": round(amount / people, 2) if amount is not None and people else None,
                 "cost_per_lead": round(amount / leads, 2) if amount is not None and leads else None,
                 "cost_per_viewing_request": round(amount / viewings, 2) if amount is not None and viewings else None,
                 "cost_per_win": round(amount / wins, 2) if amount is not None and wins else None,
@@ -583,6 +591,7 @@ def dashboard(
                 r["listing_opened"],
                 r["search_submitted"],
                 r["lead_qualified"],
+                f'{r["visitor_to_lead_pct"]}%' if r["visitor_to_lead_pct"] is not None else "—",
                 r["viewing_requested"],
                 r["deal_won"],
                 " · ".join(f"{currency} {amount:,.2f}" for currency, amount in r["spend"].items()) or "—",
@@ -595,7 +604,7 @@ def dashboard(
         )
         + "</tr>"
         for r in data["channels"]
-    ) or '<tr><td colspan="12" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
+    ) or '<tr><td colspan="13" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
     steps = "".join(
         f'<div class="step"><b>{html.escape(s["event"])}</b><span>{s["people"]} чел.</span><small>{s["from_start_pct"] if s["from_start_pct"] is not None else "—"}% от старта</small></div>'
         for s in funnel["steps"]
@@ -629,7 +638,7 @@ th{{color:#6c727f;font-weight:600}}
 <div class="grid">{steps}</div>
 <div class="card">
 <table>
-<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Объекты</th><th>Поиск</th><th>Лиды</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
+<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Объекты</th><th>Поиск</th><th>Лиды</th><th>Lead %</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </div>
