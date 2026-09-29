@@ -96,6 +96,10 @@ def main() -> int:
     if reconcile_result == "failed":
         issues.append("последний CRM reconcile завершился failed")
 
+    rc, digest_active = cmd("systemctl", "is-active", "lebleu-growth-digest.timer")
+    if rc != 0 or digest_active != "active":
+        issues.append("Growth digest timer не active")
+
     if not CATALOG.exists():
         issues.append("catalog.json отсутствует")
         catalog_count = 0
@@ -114,7 +118,11 @@ def main() -> int:
 
     publisher = load_json(PUBLISHER_STATE, {})
     entries = publisher.get("entries") if isinstance(publisher, dict) else {}
-    published_count = len(entries) if isinstance(entries, dict) else 0
+    published_count = (
+        sum(1 for entry in entries.values() if isinstance(entry, dict) and entry.get("status") == "active")
+        if isinstance(entries, dict)
+        else 0
+    )
     if catalog_count and published_count < int(catalog_count * 0.8):
         issues.append(f"Telegram publisher покрывает только {published_count}/{catalog_count}")
 
