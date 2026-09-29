@@ -6,6 +6,7 @@ import json
 import os
 import re
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
@@ -63,6 +64,7 @@ class SavedSearch(Base):
     username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     fingerprint: Mapped[str] = mapped_column(String(64))
+    tracking_token: Mapped[str | None] = mapped_column(String(24), nullable=True)
     label: Mapped[str] = mapped_column(String(255))
     criteria_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     notify: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -136,7 +138,8 @@ class SavedSearchIn(BaseModel):
     init_data: str
     criteria: dict[str, Any]
     label: str | None = Field(default=None, max_length=255)
-    notify: bool = True
+    notify: bool = False
+    link_token: str | None = Field(default=None, max_length=24)
 
 
 class EventIn(BaseModel):
@@ -144,12 +147,14 @@ class EventIn(BaseModel):
     event_name: str
     listing_code: str | None = None
     properties: dict[str, Any] = Field(default_factory=dict)
+    link_token: str | None = Field(default=None, max_length=24)
 
 
 class ActionIn(BaseModel):
     init_data: str
     listing_code: str
     action: str
+    link_token: str | None = Field(default=None, max_length=24)
 
 
 def db():
@@ -351,6 +356,30 @@ def _growth_event(user_id: int, event_name: str, *, listing_token: str | None = 
         pass
 
 
+@lru_cache(maxsize=4096)
+def _growth_link(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    try:
+        response = httpx.get(
+            f"{settings.growth_core_url.rstrip('/')}/v1/links/{token}",
+            params={"tenant": settings.growth_tenant},
+            headers={"X-Growth-Key": settings.growth_core_key},
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _tracking_token(explicit: str | None, ctx: dict[str, Any]) -> str | None:
+    start_param = str(ctx.get("start_param") or "")
+    candidate = explicit or (start_param[4:] if start_param.startswith("trk_") else None)
+    return candidate if candidate and _growth_link(candidate) else None
+
+
 def _ensure_link(item: dict[str, Any], *, source: str, medium: str, campaign: str, content: str, placement: str) -> dict[str, Any] | None:
     try:
         response = httpx.post(
@@ -417,6 +446,7 @@ def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: 
     if not settings.crm_base_url or not settings.crm_api_key:
         return
     user_id = int(user["id"])
+    attribution = _growth_link(row.tracking_token) or {}
     display_name = " ".join(
         part for part in [user.get("first_name"), user.get("last_name")] if part
     ) or user.get("username") or f"Telegram {user_id}"
@@ -459,6 +489,12 @@ def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: 
                     "telegram_username": user.get("username"),
                     "notification_opt_in": row.notify,
                     "source": settings.crm_source,
+                    "tracking_token": row.tracking_token,
+                    "tracking_source": attribution.get("source"),
+                    "tracking_medium": attribution.get("medium"),
+                    "tracking_campaign": attribution.get("campaign"),
+                    "tracking_content": attribution.get("content"),
+                    "tracking_placement": attribution.get("placement"),
                 },
             },
         )
@@ -496,6 +532,7 @@ def startup():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_contact_id VARCHAR(80)"))
         conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_opportunity_id VARCHAR(80)"))
+        conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS tracking_token VARCHAR(24)"))
 
 
 @app.get("/health")
@@ -560,8 +597,7 @@ def capture_event(body: EventIn):
         raise HTTPException(status_code=422, detail="Unsupported event")
     ctx = _validate_init_data(body.init_data)
     item = next((x for x in _catalog() if x.get("code") == body.listing_code), None) if body.listing_code else None
-    start_param = str(ctx.get("start_param") or "")
-    link_token = start_param[4:] if start_param.startswith("trk_") else None
+    link_token = _tracking_token(body.link_token, ctx)
     _growth_event(
         int(ctx["user"]["id"]),
         body.event_name,
@@ -587,13 +623,15 @@ def action(body: ActionIn):
     event = event_map.get(body.action)
     if not event:
         raise HTTPException(status_code=422, detail="Unsupported action")
+    acquisition_token = _tracking_token(body.link_token, ctx)
+    attribution = _growth_link(acquisition_token) if acquisition_token else None
     link = _ensure_link(
         item,
-        source="telegram_miniapp",
-        medium="owned",
-        campaign="miniapp_catalog",
+        source=str((attribution or {}).get("source") or "telegram_miniapp"),
+        medium=str((attribution or {}).get("medium") or "owned"),
+        campaign=str((attribution or {}).get("campaign") or "miniapp_catalog"),
         content=body.action,
-        placement="listing_detail",
+        placement="miniapp_listing_detail",
     )
     _growth_event(
         int(ctx["user"]["id"]),
@@ -629,6 +667,7 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
     ctx = _validate_init_data(body.init_data)
     user = ctx["user"]
     user_id = int(user["id"])
+    tracking_token = _tracking_token(body.link_token, ctx)
     criteria = body.criteria
     if not any([
         criteria.get("neighborhoods"),
@@ -654,6 +693,7 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
             username=user.get("username"),
             display_name=" ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or user.get("username"),
             fingerprint=fp,
+            tracking_token=tracking_token,
             label=(body.label or _label(criteria))[:255],
             criteria_json=criteria,
             notify=body.notify,
@@ -675,15 +715,32 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
         row.active = True
         row.updated_at = now
         row.label = (body.label or row.label)[:255]
+        if not row.tracking_token and tracking_token:
+            row.tracking_token = tracking_token
     matches_now = len(_search(criteria))
     session.flush()
     if not _is_test_user(user_id):
         _crm_sync_saved_search(row, user, matches_now)
     session.commit()
-    _growth_event(user_id, "search_submitted", properties={"saved_search_id": str(row.id), "matches_now": matches_now})
+    _growth_event(
+        user_id,
+        "search_submitted",
+        properties={"saved_search_id": str(row.id), "matches_now": matches_now},
+        link_token=row.tracking_token,
+    )
     if body.notify:
-        _growth_event(user_id, "notification_opt_in", properties={"saved_search_id": str(row.id)})
-    _growth_event(user_id, "lead_qualified", properties={"lead_kind": "saved_search", "saved_search_id": str(row.id)})
+        _growth_event(
+            user_id,
+            "notification_opt_in",
+            properties={"saved_search_id": str(row.id)},
+            link_token=row.tracking_token,
+        )
+    _growth_event(
+        user_id,
+        "lead_qualified",
+        properties={"lead_kind": "saved_search", "saved_search_id": str(row.id)},
+        link_token=row.tracking_token,
+    )
     if settings.operator_chat_id and not _is_test_user(user_id):
         who = f"@{user.get('username')}" if user.get("username") else (row.display_name or str(user_id))
         _bot_send(
@@ -725,29 +782,30 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
     notifications = 0
     new_matches = 0
     for search in searches:
-        unseen: list[dict[str, Any]] = []
+        pending: list[tuple[dict[str, Any], SavedSearchMatch]] = []
         for item in _search(search.criteria_json):
             # Notify once per listing code. A photo/text/source-fingerprint refresh must
-            # not look like a new property. A listing that did not match before has no
-            # baseline row, so a later price/criteria change into range can still notify.
-            exists = session.scalar(select(SavedSearchMatch).where(
+            # not look like a new property. If Telegram delivery fails, keep the match
+            # pending and retry on the next catalogue sync instead of silently losing it.
+            match = session.scalar(select(SavedSearchMatch).where(
                 SavedSearchMatch.search_id == search.id,
                 SavedSearchMatch.listing_code == item.get("code"),
             ))
-            if exists:
+            if match and match.notified_at is not None:
                 continue
-            row = SavedSearchMatch(
-                search_id=search.id,
-                listing_code=item.get("code") or "",
-                source_fingerprint=item.get("sourceFingerprint") or "",
-            )
-            session.add(row)
-            session.flush()
-            unseen.append(item)
-            new_matches += 1
-        if not unseen:
+            if match is None:
+                match = SavedSearchMatch(
+                    search_id=search.id,
+                    listing_code=item.get("code") or "",
+                    source_fingerprint=item.get("sourceFingerprint") or "",
+                )
+                session.add(match)
+                session.flush()
+                new_matches += 1
+            pending.append((item, match))
+        if not pending:
             continue
-        chosen = unseen[:3]
+        chosen = [item for item, _ in pending[:3]]
         lines = ["✨ <b>Появились новые варианты по вашему поиску</b>", search.label, ""]
         keyboard = []
         for item in chosen:
@@ -763,26 +821,20 @@ def rematch(x_intent_key: str | None = Header(default=None), session: Session = 
             )
             url = (link or {}).get("telegram_url") or f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
             keyboard.append([{"text": f"Открыть {item.get('code')}", "url": url}])
-        if len(unseen) > 3:
-            lines.append(f"\nИ ещё {len(unseen) - 3} новых.")
+        if len(pending) > 3:
+            lines.append(f"\nИ ещё {len(pending) - 3} новых.")
         keyboard.append([{"text": "Открыть каталог", "web_app": {"url": settings.miniapp_url}}])
         sent = _bot_send(search.telegram_user_id, "\n".join(lines), {"inline_keyboard": keyboard})
         now = datetime.now(UTC)
         if sent:
             notifications += 1
             search.last_notified_at = now
-            for item in unseen:
-                match = session.scalar(select(SavedSearchMatch).where(
-                    SavedSearchMatch.search_id == search.id,
-                    SavedSearchMatch.listing_code == item.get("code"),
-                    SavedSearchMatch.source_fingerprint == item.get("sourceFingerprint"),
-                ))
-                if match:
-                    match.notified_at = now
+            for _, match in pending:
+                match.notified_at = now
             _growth_event(
                 search.telegram_user_id,
                 "notification_sent",
-                properties={"saved_search_id": str(search.id), "new_matches": len(unseen)},
+                properties={"saved_search_id": str(search.id), "new_matches": len(pending)},
             )
     session.commit()
     return {"ok": True, "active_searches": len(searches), "new_matches": new_matches, "notifications": notifications}
