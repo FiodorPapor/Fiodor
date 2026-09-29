@@ -584,7 +584,16 @@ def _tracking_token(explicit: str | None, ctx: dict[str, Any]) -> str | None:
     return candidate if candidate and _growth_link(candidate) else None
 
 
-def _ensure_link(item: dict[str, Any], *, source: str, medium: str, campaign: str, content: str, placement: str) -> dict[str, Any] | None:
+def _ensure_link(
+    item: dict[str, Any],
+    *,
+    source: str,
+    medium: str,
+    campaign: str,
+    content: str,
+    placement: str,
+    metadata_extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     try:
         response = httpx.post(
             f"{settings.growth_core_url.rstrip('/')}/v1/links/ensure",
@@ -598,7 +607,11 @@ def _ensure_link(item: dict[str, Any], *, source: str, medium: str, campaign: st
                 "listing_code": item["listingToken"],
                 "intent": "listing",
                 "bot_username": settings.telegram_bot_username,
-                "metadata": {"code": item.get("code"), "source_url": item.get("sourceUrl")},
+                "metadata": {
+                    "code": item.get("code"),
+                    "source_url": item.get("sourceUrl"),
+                    **(metadata_extra or {}),
+                },
             },
             headers={"X-Growth-Key": settings.growth_core_key},
             timeout=3.0,
@@ -947,6 +960,41 @@ def action(body: ActionIn):
     item = next((x for x in _catalog() if x.get("code") == body.listing_code), None)
     if not item:
         raise HTTPException(status_code=404, detail="Listing not found")
+    acquisition_token = _tracking_token(body.link_token, ctx)
+    user_id = int(ctx["user"]["id"])
+
+    if body.action == "share":
+        _growth_event(
+            user_id,
+            "share_clicked",
+            listing_token=item["listingToken"],
+            properties={"via": "miniapp"},
+            link_token=acquisition_token,
+        )
+        share_link = _ensure_link(
+            item,
+            source="telegram_share",
+            medium="earned",
+            campaign="property_share",
+            content="listing",
+            placement="miniapp_share_button",
+            metadata_extra={"parent_tracking_token": acquisition_token},
+        )
+        share_target = (share_link or {}).get("telegram_url") or (
+            f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
+        )
+        share_text = (
+            f"{item.get('address') or item.get('code')} · "
+            f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}"
+        ).strip()
+        return {
+            "ok": True,
+            "telegram_url": share_target,
+            "share_url": "https://t.me/share/url?" + urlencode(
+                {"url": share_target, "text": share_text}
+            ),
+        }
+
     event_map = {
         "availability": "availability_requested",
         "viewing": "viewing_requested",
@@ -956,7 +1004,6 @@ def action(body: ActionIn):
     event = event_map.get(body.action)
     if not event:
         raise HTTPException(status_code=422, detail="Unsupported action")
-    acquisition_token = _tracking_token(body.link_token, ctx)
     attribution = _growth_link(acquisition_token) if acquisition_token else None
     link = _ensure_link(
         item,
@@ -967,7 +1014,7 @@ def action(body: ActionIn):
         placement="miniapp_listing_detail",
     )
     _growth_event(
-        int(ctx["user"]["id"]),
+        user_id,
         event,
         listing_token=item["listingToken"],
         properties={"action": body.action},
