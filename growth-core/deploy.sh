@@ -13,6 +13,7 @@ docker compose up -d api >>"$LOG" 2>&1
 for _ in $(seq 1 30); do
   if curl -fsS --max-time 2 http://127.0.0.1:8040/health >/dev/null 2>&1; then
     echo "growth-core healthy"
+    /opt/growth-core/smoke-test.sh
     exit 0
   fi
   sleep 1
