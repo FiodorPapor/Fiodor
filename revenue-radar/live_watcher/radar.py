@@ -22,8 +22,10 @@ API_HASH = os.environ["TG_API_HASH"]
 SESSION = os.environ.get("TG_SESSION", "/opt/intent-radar/data/fiodor")
 CONFIG_PATH = os.environ.get("RADAR_CONFIG", "/opt/intent-radar/config.json")
 DB_PATH = os.environ.get("RADAR_DB", "/opt/intent-radar/data/signals.sqlite3")
-BOT_TOKEN = os.environ.get("RADAR_BOT_TOKEN", "")
-BOT_CHAT_ID = os.environ.get("RADAR_BOT_CHAT_ID", "")
+BOT_TOKEN = os.environ.get("RADAR_ALERT_BOT_TOKEN") or os.environ.get("RADAR_BOT_TOKEN", "")
+BOT_CHAT_ID = os.environ.get("RADAR_ALERT_CHAT_ID") or os.environ.get("RADAR_BOT_CHAT_ID", "")
+OPP_DB_PATH = os.environ.get("RR_OPPORTUNITY_DB", "/opt/intent-radar/data/opportunities.sqlite3")
+BROAD_DB_PATH = os.environ.get("RR_BROAD_DB", "/opt/intent-radar/data/broad_radar.sqlite3")
 DYNAMIC_SOURCES_PATH = Path("/opt/intent-radar/data/dynamic_public_sources.json")
 LEGACY_ALERTS = os.environ.get("RADAR_LEGACY_ALERTS", "0") == "1"
 
@@ -181,12 +183,103 @@ async def process_candidate(chat, chat_id, message_id, text, date, sender):
     await send_operator_alert(alert, link, copy_prompt)
 
 
+def _active_opportunities_for_sender(sender):
+    if not isinstance(sender, User) or getattr(sender, "bot", False):
+        return []
+    con = sqlite3.connect(OPP_DB_PATH, timeout=5)
+    con.row_factory = sqlite3.Row
+    try:
+        sid = str(sender.id)
+        uname = (sender.username or "").lower()
+        return con.execute(
+            """SELECT o.id,o.kind,o.stage,o.priority,o.title,p.username,p.display_name
+               FROM opportunities o JOIN people p ON p.id=o.person_id
+               WHERE o.archived_reason IS NULL
+                 AND upper(o.stage) NOT IN ('CLOSED','LOST','ARCHIVED')
+                 AND (p.platform_user_id=? OR (?<>'' AND lower(COALESCE(p.username,''))=?))
+               ORDER BY CASE o.priority WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, o.updated_at DESC""",
+            (sid, uname, uname),
+        ).fetchall()
+    finally:
+        con.close()
+
+def _store_private_inbound(sender, message_id, occurred_at, text):
+    con = sqlite3.connect(OPP_DB_PATH, timeout=5)
+    try:
+        con.execute("""CREATE TABLE IF NOT EXISTS inbound_messages(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL DEFAULT 'telegram',
+          platform_user_id TEXT NOT NULL, username TEXT, display_name TEXT,
+          message_id INTEGER NOT NULL, occurred_at TEXT, text TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(platform_user_id,message_id)
+        )""")
+        display = " ".join(x for x in [getattr(sender,'first_name',None),getattr(sender,'last_name',None)] if x)
+        cur = con.execute(
+            "INSERT OR IGNORE INTO inbound_messages(platform_user_id,username,display_name,message_id,occurred_at,text,created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(sender.id), sender.username or '', display, int(message_id), occurred_at, text, datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        return cur.rowcount == 1
+    finally:
+        con.close()
+
+async def handle_private_inbound(event, sender):
+    opps = _active_opportunities_for_sender(sender)
+    username = (getattr(sender, "username", None) or "").lower().lstrip("@")
+    commercial_watch = {
+        str(x).lower().lstrip("@")
+        for x in CFG.get("commercial_watch_usernames", [])
+    }
+    is_commercial_watch = bool(username and username in commercial_watch)
+    if not opps and not is_commercial_watch:
+        return
+    occurred = event.date.astimezone(timezone.utc).isoformat() if event.date else datetime.now(timezone.utc).isoformat()
+    if not _store_private_inbound(sender, event.id, occurred, event.raw_text):
+        return
+    who = f"@{sender.username}" if sender.username else " ".join(x for x in [sender.first_name,sender.last_name] if x) or str(sender.id)
+    link = f"https://t.me/{sender.username}" if sender.username else ""
+    if is_commercial_watch and not opps:
+        text = (
+            f"📣 Ответ по коммерческому размещению · {who}\n\n"
+            f"{compact(event.raw_text)}\n\n"
+            "Следующий шаг: проверить условия и решить, запускать ли измеряемый acquisition test."
+        )
+        await send_operator_alert(
+            text,
+            link,
+            "Разбери ответ рекламного партнёра: цена, формат, ссылка на бот, ограничения и лучший следующий шаг. "
+            + compact(event.raw_text, 140),
+        )
+        return
+    labels = "; ".join(f"#{x['id']} {x['kind']}/{x['stage']}" for x in opps[:3])
+    text = f"↩️ Ответ от лида · {who}\n{labels}\n\n{compact(event.raw_text)}\n\nНужен human handoff: открыть диалог и ответить по контексту."
+    await send_operator_alert(text, link, "Разбери входящий ответ лида и предложи короткий человеческий ответ без продажи в лоб: " + compact(event.raw_text,120))
+
+def live_group_allowed(chat):
+    title = " ".join(str(getattr(chat, "title", "") or "").lower().replace("ё", "е").split())
+    username = str(getattr(chat, "username", "") or "").lower()
+    core_usernames = {str(x).lower().lstrip("@") for x in CFG.get("public_watch_groups", [])}
+    if username and username.lstrip("@") in core_usernames:
+        return True
+    hay = f"{title} {username}"
+    terms = CFG.get("live_watch_terms", ["аргентин", "argentin", "buenos aires", "буэнос", "baires"])
+    if any(str(term).lower() in hay for term in terms):
+        return True
+    extras = CFG.get("live_watch_extra_titles", [])
+    return any(str(term).lower() in title for term in extras)
+
 @client.on(events.NewMessage)
 async def on_new_message(event):
-    if not event.is_group or event.out or not event.raw_text or event.message.fwd_from:
+    if event.out or not event.raw_text or event.message.fwd_from:
         return
     sender = await event.get_sender()
+    if event.is_private:
+        await handle_private_inbound(event, sender)
+        return
+    if not event.is_group:
+        return
     chat = await event.get_chat()
+    if not live_group_allowed(chat):
+        return
     await process_candidate(chat, event.chat_id, event.id, event.raw_text, event.date, sender)
 
 
@@ -274,6 +367,49 @@ async def poll_public_groups():
         await asyncio.sleep(interval)
 
 
+async def process_draft_jobs():
+    """Save operator-approved reply drafts into Telegram without sending them."""
+    print("Telegram draft worker online", flush=True)
+    while True:
+        con = None
+        try:
+            con = sqlite3.connect(BROAD_DB_PATH, timeout=5)
+            con.row_factory = sqlite3.Row
+            jobs = con.execute(
+                "SELECT * FROM draft_jobs WHERE status='PENDING' ORDER BY id LIMIT 8"
+            ).fetchall()
+            for job in jobs:
+                try:
+                    peer = await client.get_input_entity(int(job["chat_id"]))
+                    await client(functions.messages.SaveDraftRequest(
+                        peer=peer,
+                        message=job["text"],
+                        no_webpage=True,
+                        reply_to=types.InputReplyToMessage(reply_to_msg_id=int(job["message_id"])),
+                    ))
+                    con.execute(
+                        "UPDATE draft_jobs SET status='DONE',processed_at=? WHERE id=?",
+                        (datetime.now(timezone.utc).isoformat(), job["id"]),
+                    )
+                    con.commit()
+                    print(f"Saved Telegram draft job {job['id']} -> chat {job['chat_id']} reply {job['message_id']}", flush=True)
+                except Exception as exc:
+                    con.execute(
+                        "UPDATE draft_jobs SET status='ERROR',error=?,processed_at=? WHERE id=?",
+                        (f"{type(exc).__name__}: {str(exc)[:300]}", datetime.now(timezone.utc).isoformat(), job["id"]),
+                    )
+                    con.commit()
+                    print(f"Draft job {job['id']} failed: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                print(f"Draft queue DB error: {str(exc)[:160]}", flush=True)
+        except Exception as exc:
+            print(f"Draft worker error: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        finally:
+            if con is not None:
+                con.close()
+        await asyncio.sleep(3)
+
 async def main():
     await client.start()
     me = await client.get_me()
@@ -281,11 +417,13 @@ async def main():
     print("Listening to joined groups + polling selected public groups. No outreach is automated.", flush=True)
     watcher = asyncio.create_task(poll_public_groups())
     discovery = asyncio.create_task(discover_public_sources())
+    draft_worker = asyncio.create_task(process_draft_jobs())
     try:
         await client.run_until_disconnected()
     finally:
         watcher.cancel()
         discovery.cancel()
+        draft_worker.cancel()
 
 
 if __name__ == "__main__":
