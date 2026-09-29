@@ -102,7 +102,7 @@ def cmd_report(args):
     if not rows:
         print(f"{args.tenant}: no production events/spend in last {args.days} days")
         return
-    headers = ["source", "medium", "campaign", "people", "app", "shared", "leads", "lead%", "view", "wins", "spend", "CPL"]
+    headers = ["source", "medium", "campaign", "people", "app", "app%", "shared", "leads", "lead%", "view", "wins", "spend", "CPL"]
     out = []
     for row in rows:
         spend = ",".join(f"{k} {v:g}" for k, v in row["spend"].items()) or "—"
@@ -111,9 +111,12 @@ def cmd_report(args):
             if row["cost_currency"] and row["cost_per_lead"] is not None
             else "—"
         )
+        starts = int(row.get("bot_starts") or 0)
+        app_opens = int(row.get("catalog_opened") or 0)
+        app_pct = round(app_opens / starts * 100, 1) if starts else None
         out.append([
             row["source"], row["medium"], row["campaign"], row["people"],
-            row.get("catalog_opened", 0), row.get("share_sent", 0),
+            app_opens, fmt_num(app_pct), row.get("share_sent", 0),
             row["lead_qualified"], fmt_num(row["visitor_to_lead_pct"]),
             row["viewing_requested"], row["deal_won"], spend, cpl,
         ])
