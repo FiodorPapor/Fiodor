@@ -21,6 +21,9 @@ type SavedSearch = {id:string; label:string; criteria:Record<string,unknown>; no
 
 const tg = window.Telegram?.WebApp;
 const initData = tg?.initData || '';
+const startParam = String(tg?.initDataUnsafe?.start_param || '');
+const urlTracking = new URLSearchParams(window.location.search).get('trk') || '';
+const trackingToken = urlTracking || (startParam.startsWith('trk_') ? startParam.slice(4) : '');
 
 function api<T>(path:string, options?:RequestInit):Promise<T>{
   return fetch(path,{
@@ -129,7 +132,8 @@ function App(){
     if(!initData) return;
     try{
       await api('/api/v1/events',{method:'POST',body:JSON.stringify({
-        init_data:initData,event_name:name,listing_code:listing?.code,properties
+        init_data:initData,event_name:name,listing_code:listing?.code,properties,
+        link_token:trackingToken||undefined
       })});
     }catch{}
   }
@@ -196,7 +200,9 @@ function App(){
     setBusy(true);
     try{
       const res=await api<{telegram_url:string}>('/api/v1/actions',{
-        method:'POST',body:JSON.stringify({init_data:initData,listing_code:selected.code,action})
+        method:'POST',body:JSON.stringify({
+          init_data:initData,listing_code:selected.code,action,link_token:trackingToken||undefined
+        })
       });
       haptic('success');
       if(tg?.openTelegramLink) tg.openTelegramLink(res.telegram_url);
@@ -211,7 +217,9 @@ function App(){
     try{
       const res=await api<{label:string;matches_now:number}>('/api/v1/saved-searches',{
         method:'POST',
-        body:JSON.stringify({init_data:initData,criteria:filtersToCriteria(filters),notify})
+        body:JSON.stringify({
+          init_data:initData,criteria:filtersToCriteria(filters),notify,link_token:trackingToken||undefined
+        })
       });
       setSaveOpen(false);
       haptic('success');
@@ -360,12 +368,16 @@ function ListingDetail({item,busy,onBack,onAction,onGallery}:{item:Listing;busy:
         {item.highlightedFeatures.map(x=><span key={x}>{x}</span>)}
       </div></section>}
       {!!item.notes.length&&<section className="noteBox">{item.notes.map(x=><p key={x}>{x}</p>)}</section>}
+      <div className="detailQuickActions">
+        <button onClick={()=>onAction('question')} disabled={busy}><MessageCircle size={17}/> Задать вопрос</button>
+        <button onClick={()=>onAction('similar')} disabled={busy}><Search size={17}/> Подобрать похожие</button>
+      </div>
       <button className="sourceLink" onClick={()=>tg?.openLink?tg.openLink(item.sourceUrl):window.open(item.sourceUrl,'_blank')}>
         Оригинал на Le Bleu <ChevronRight size={17}/>
       </button>
     </div>
     <div className="detailActions">
-      <button className="secondaryAction" disabled={busy} onClick={()=>onAction('question')}><MessageCircle size={18}/> Задать вопрос</button>
+      <button className="secondaryAction" disabled={busy} onClick={()=>onAction('availability')}><Check size={18}/> Проверить актуальность</button>
       <button className="primaryAction" disabled={busy} onClick={()=>onAction('viewing')}>Записаться на просмотр</button>
     </div>
   </div>;
