@@ -1,0 +1,788 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl
+from uuid import UUID, uuid4
+
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, create_engine, select, text
+from sqlalchemy.dialects.postgresql import UUID as PgUUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    database_url: str
+    service_key: str
+    telegram_bot_token: str
+    telegram_bot_username: str = "LeBleuArgentinaBot"
+    operator_chat_id: str = ""
+    growth_core_url: str = "http://growth-core-api:8080"
+    growth_core_key: str
+    growth_tenant: str = "lebleu"
+    brand_name: str = "Le Bleu"
+    crm_source: str = "lebleu_miniapp"
+    crm_saved_search_type: str = "property_saved_search"
+    miniapp_url: str = "https://lebleu-app.srv1636153.hstgr.cloud"
+    crm_base_url: str = ""
+    crm_api_key: str = ""
+    catalog_path: str = "/data/catalog.json"
+    quality_path: str = "/data/quality.json"
+    init_data_max_age_seconds: int = 86400
+    test_telegram_ids: str = ""
+
+
+settings = Settings()
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class SavedSearch(Base):
+    __tablename__ = "saved_searches"
+    __table_args__ = (
+        UniqueConstraint("tenant", "telegram_user_id", "fingerprint", name="uq_saved_search_identity"),
+        Index("ix_saved_search_active", "tenant", "active", "notify"),
+    )
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant: Mapped[str] = mapped_column(String(64), index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(255))
+    criteria_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    notify: Mapped[bool] = mapped_column(Boolean, default=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    crm_contact_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    crm_opportunity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+class SavedSearchMatch(Base):
+    __tablename__ = "saved_search_matches"
+    __table_args__ = (
+        UniqueConstraint("search_id", "listing_code", "source_fingerprint", name="uq_saved_match_version"),
+        Index("ix_saved_match_search", "search_id", "first_seen_at"),
+    )
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    search_id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), ForeignKey("saved_searches.id", ondelete="CASCADE"), index=True)
+    listing_code: Mapped[str] = mapped_column(String(120))
+    source_fingerprint: Mapped[str] = mapped_column(String(80))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+NEIGHBORHOODS = {
+    "palermo": ["palermo", "botanico", "botánico", "las cañitas", "las canitas"],
+    "recoleta": ["recoleta"],
+    "belgrano": ["belgrano"],
+    "nunez": ["núñez", "nunez", "nuñez"],
+    "colegiales": ["colegiales"],
+    "villa urquiza": ["villa urquiza"],
+    "caballito": ["caballito"],
+    "chacarita": ["chacarita"],
+    "villa crespo": ["villa crespo"],
+    "barracas": ["barracas"],
+    "balvanera": ["balvanera"],
+    "san nicolas": ["san nicolás", "san nicolas"],
+    "retiro": ["retiro"],
+    "puerto madero": ["puerto madero"],
+    "almagro": ["almagro"],
+    "san telmo": ["san telmo"],
+    "saavedra": ["saavedra"],
+    "parque chas": ["parque chas"],
+    "villa devoto": ["villa devoto"],
+    "villa del parque": ["villa del parque"],
+    "flores": ["flores"],
+    "floresta": ["floresta"],
+    "boedo": ["boedo"],
+    "san cristobal": ["san cristóbal", "san cristobal"],
+    "la plata": ["la plata"],
+    "city bell": ["city bell"],
+}
+FEATURE_ALIASES = {
+    "balcon": ["balcón", "balcon"],
+    "pileta": ["pileta", "piscina"],
+    "parrilla": ["parrilla"],
+    "cochera": ["cochera", "garage", "garaje"],
+    "amoblado": ["amoblado", "amueblado"],
+    "laundry": ["laundry", "lavadero"],
+    "aire": ["aire acondicionado"],
+    "terraza": ["terraza"],
+}
+
+
+class SessionIn(BaseModel):
+    init_data: str
+
+
+class SavedSearchIn(BaseModel):
+    init_data: str
+    criteria: dict[str, Any]
+    label: str | None = Field(default=None, max_length=255)
+    notify: bool = True
+
+
+class EventIn(BaseModel):
+    init_data: str
+    event_name: str
+    listing_code: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionIn(BaseModel):
+    init_data: str
+    listing_code: str
+    action: str
+
+
+def db():
+    with SessionLocal() as session:
+        yield session
+
+
+def _norm(value: Any) -> str:
+    return " ".join(str(value or "").lower().replace("ё", "е").split())
+
+
+def _load_json(path: str, fallback: Any):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+
+
+_catalog_cache: dict[str, Any] = {"mtime": 0.0, "quality_mtime": 0.0, "items": []}
+
+
+def _catalog() -> list[dict[str, Any]]:
+    try:
+        mtime = os.path.getmtime(settings.catalog_path)
+        qtime = os.path.getmtime(settings.quality_path)
+    except OSError:
+        return []
+    if _catalog_cache["items"] and _catalog_cache["mtime"] == mtime and _catalog_cache["quality_mtime"] == qtime:
+        return _catalog_cache["items"]
+    raw = _load_json(settings.catalog_path, [])
+    quality = _load_json(settings.quality_path, {})
+    items: list[dict[str, Any]] = []
+    for src in raw:
+        q = quality.get(src.get("sourceUrl")) or {}
+        current = not q.get("sourceFingerprint") or q.get("sourceFingerprint") == src.get("sourceFingerprint")
+        details = dict(src.get("details") or {})
+        if current:
+            details.update(q.get("details_override") or {})
+        ptype = (q.get("property_type_override") if current else None) or src.get("propertyType")
+        item = {
+            "code": src.get("code"),
+            "operation": src.get("operation"),
+            "propertyType": ptype,
+            "address": src.get("address"),
+            "priceAmount": src.get("priceAmount"),
+            "priceCurrency": src.get("priceCurrency"),
+            "details": details,
+            "highlightedFeatures": src.get("highlightedFeatures") or [],
+            "description": (q.get("summary_ru") if current else None) or src.get("description") or "",
+            "notes": (q.get("notes_ru") if current else []) or [],
+            "images": (src.get("imageUrls") or [])[:16],
+            "sourceUrl": src.get("sourceUrl"),
+            "slug": src.get("slug"),
+            "sourceFingerprint": src.get("sourceFingerprint") or "",
+        }
+        item["neighborhoods"] = _listing_neighborhoods(item)
+        item["listingToken"] = _listing_token(item)
+        items.append(item)
+    _catalog_cache.update({"mtime": mtime, "quality_mtime": qtime, "items": items})
+    return items
+
+
+def _listing_token(item: dict[str, Any]) -> str:
+    source = str(item.get("sourceUrl") or "")
+    suffix = hashlib.sha256(source.encode()).hexdigest()[:8]
+    return f"{item.get('code')}_{suffix}"
+
+
+def _listing_neighborhoods(item: dict[str, Any]) -> list[str]:
+    blob = _norm(" ".join([str(item.get("address") or ""), str(item.get("slug") or "")]))
+    return [name for name, aliases in NEIGHBORHOODS.items() if any(alias in blob for alias in aliases)]
+
+
+def _listing_blob(item: dict[str, Any]) -> str:
+    return _norm(" ".join([
+        str(item.get("address") or ""),
+        str(item.get("description") or ""),
+        " ".join(item.get("highlightedFeatures") or []),
+        str(item.get("slug") or ""),
+    ]))
+
+
+def _safe_num(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _match(item: dict[str, Any], criteria: dict[str, Any]) -> bool:
+    op = criteria.get("operation")
+    if op and item.get("operation") != op:
+        return False
+    ptypes = set(criteria.get("propertyTypes") or [])
+    if ptypes and item.get("propertyType") not in ptypes:
+        return False
+    hoods = set(criteria.get("neighborhoods") or [])
+    if hoods and not hoods.intersection(item.get("neighborhoods") or []):
+        return False
+    d = item.get("details") or {}
+    rooms = criteria.get("rooms")
+    if rooms and int(d.get("rooms") or 0) != int(rooms):
+        return False
+    bedrooms = criteria.get("bedrooms")
+    if bedrooms and int(d.get("bedrooms") or 0) != int(bedrooms):
+        return False
+    min_area = _safe_num(criteria.get("minArea"))
+    if min_area and _safe_num(d.get("totalAreaM2") or d.get("coveredAreaM2") or 0) < min_area:
+        return False
+    max_area = _safe_num(criteria.get("maxArea"))
+    if max_area and _safe_num(d.get("totalAreaM2") or d.get("coveredAreaM2") or 0) > max_area:
+        return False
+    budget = _safe_num(criteria.get("maxBudget"))
+    currency = criteria.get("budgetCurrency")
+    if budget:
+        price = _safe_num(item.get("priceAmount"))
+        if not price or item.get("priceCurrency") != currency or price > budget:
+            return False
+    blob = _listing_blob(item)
+    for feature in criteria.get("features") or []:
+        aliases = FEATURE_ALIASES.get(feature, [feature])
+        if not any(alias in blob for alias in aliases):
+            return False
+    query = _norm(criteria.get("query"))
+    if query:
+        tokens = [x for x in re.findall(r"[a-záéíóúñüа-я0-9]{3,}", query) if x not in {"квартира", "квартиру", "дом", "ищу", "нужна"}]
+        if tokens and not any(token in blob for token in tokens):
+            return False
+    return True
+
+
+def _search(criteria: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [item for item in _catalog() if _match(item, criteria)]
+    rows.sort(key=lambda item: (_safe_num(item.get("priceAmount")) or 10**18, item.get("code") or ""))
+    return rows
+
+
+def _validate_init_data(raw: str) -> dict[str, Any]:
+    if not raw:
+        raise HTTPException(status_code=401, detail="Telegram authorization required")
+    pairs = dict(parse_qsl(raw, keep_blank_values=True))
+    received_hash = pairs.pop("hash", "")
+    pairs.pop("signature", None)
+    if not received_hash:
+        raise HTTPException(status_code=401, detail="Missing Telegram hash")
+    data_check = "\n".join(f"{key}={value}" for key, value in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", settings.telegram_bot_token.encode(), hashlib.sha256).digest()
+    calculated = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calculated, received_hash):
+        raise HTTPException(status_code=401, detail="Invalid Telegram signature")
+    try:
+        auth_date = int(pairs.get("auth_date") or "0")
+    except ValueError:
+        auth_date = 0
+    now = int(datetime.now(UTC).timestamp())
+    if not auth_date or now - auth_date > settings.init_data_max_age_seconds or auth_date > now + 60:
+        raise HTTPException(status_code=401, detail="Expired Telegram authorization")
+    try:
+        user = json.loads(pairs.get("user") or "{}")
+    except json.JSONDecodeError:
+        user = {}
+    if not user.get("id"):
+        raise HTTPException(status_code=401, detail="Telegram user missing")
+    return {"user": user, "start_param": pairs.get("start_param"), "raw": pairs}
+
+
+def _is_test_user(user_id: int) -> bool:
+    values = {
+        int(part.strip())
+        for part in settings.test_telegram_ids.split(",")
+        if part.strip().lstrip("-").isdigit()
+    }
+    return user_id in values
+
+
+def _growth_event(user_id: int, event_name: str, *, listing_token: str | None = None, properties: dict[str, Any] | None = None, link_token: str | None = None):
+    payload = {
+        "tenant": settings.growth_tenant,
+        "event_name": event_name,
+        "actor_external_id": user_id,
+        "link_token": link_token,
+        "listing_code": listing_token,
+        "source": None if link_token else "telegram_miniapp",
+        "medium": None if link_token else "owned",
+        "campaign": None if link_token else "miniapp_catalog",
+        "content": None if link_token else "app",
+        "placement": None if link_token else "miniapp",
+        "properties": properties or {},
+        "is_test": _is_test_user(user_id),
+    }
+    try:
+        httpx.post(
+            f"{settings.growth_core_url.rstrip('/')}/v1/events",
+            json=payload,
+            headers={"X-Growth-Key": settings.growth_core_key},
+            timeout=3.0,
+        ).raise_for_status()
+    except Exception:
+        pass
+
+
+def _ensure_link(item: dict[str, Any], *, source: str, medium: str, campaign: str, content: str, placement: str) -> dict[str, Any] | None:
+    try:
+        response = httpx.post(
+            f"{settings.growth_core_url.rstrip('/')}/v1/links/ensure",
+            json={
+                "tenant": settings.growth_tenant,
+                "source": source,
+                "medium": medium,
+                "campaign": campaign,
+                "content": content,
+                "placement": placement,
+                "listing_code": item["listingToken"],
+                "intent": "listing",
+                "bot_username": settings.telegram_bot_username,
+                "metadata": {"code": item.get("code"), "source_url": item.get("sourceUrl")},
+            },
+            headers={"X-Growth-Key": settings.growth_core_key},
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+
+def _bot_send(chat_id: int | str, text: str, reply_markup: dict[str, Any] | None = None) -> bool:
+    try:
+        response = httpx.post(
+            f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                **({"reply_markup": reply_markup} if reply_markup else {}),
+            },
+            timeout=8.0,
+        )
+        response.raise_for_status()
+        return bool(response.json().get("ok"))
+    except Exception:
+        return False
+
+
+def _crm_post(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    base = settings.crm_base_url.rstrip("/")
+    if not base or not settings.crm_api_key:
+        return None
+    try:
+        response = httpx.post(
+            f"{base}{path}",
+            json=payload,
+            headers={"X-API-Key": settings.crm_api_key},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: int) -> None:
+    if not settings.crm_base_url or not settings.crm_api_key:
+        return
+    user_id = int(user["id"])
+    display_name = " ".join(
+        part for part in [user.get("first_name"), user.get("last_name")] if part
+    ) or user.get("username") or f"Telegram {user_id}"
+    if not row.crm_contact_id:
+        contact = _crm_post(
+            "/v1/contacts/upsert",
+            {
+                "display_name": display_name,
+                "identity": {
+                    "channel": "telegram",
+                    "value": str(user_id),
+                    "external_id": str(user_id),
+                    "verified": True,
+                    "is_primary": True,
+                },
+                "preferred_language": "ru",
+                "relationship_stage": "lead",
+                "priority": "medium",
+                "summary_current": f"{settings.brand_name} Mini App. Сохранённый поиск: {row.label}",
+            },
+        )
+        if contact and contact.get("id"):
+            row.crm_contact_id = str(contact["id"])
+    if row.crm_contact_id and not row.crm_opportunity_id:
+        opportunity = _crm_post(
+            "/v1/opportunities",
+            {
+                "name": f"{settings.brand_name} · сохранённый поиск · {row.label}"[:255],
+                "type": settings.crm_saved_search_type,
+                "stage": "qualifying",
+                "contact_id": row.crm_contact_id,
+                "probability": 60,
+                "source": settings.crm_source,
+                "next_action": "Просмотреть критерии сохранённого поиска и реагировать на новые совпадения",
+                "summary_current": f"{row.label}. Совпадений сейчас: {matches_now}. Уведомления: {'да' if row.notify else 'нет'}.",
+                "extra_json": {
+                    "saved_search_id": str(row.id),
+                    "criteria": row.criteria_json,
+                    "telegram_user_id": user_id,
+                    "telegram_username": user.get("username"),
+                    "notification_opt_in": row.notify,
+                    "source": settings.crm_source,
+                },
+            },
+        )
+        if opportunity and opportunity.get("id"):
+            row.crm_opportunity_id = str(opportunity["id"])
+
+
+def _label(criteria: dict[str, Any]) -> str:
+    bits = []
+    if criteria.get("operation"):
+        bits.append("Покупка" if criteria["operation"] == "Venta" else "Аренда")
+    hoods = criteria.get("neighborhoods") or []
+    if hoods:
+        bits.append(", ".join(x.title() for x in hoods[:3]))
+    if criteria.get("rooms"):
+        bits.append(f"{criteria['rooms']} комн.")
+    if criteria.get("maxBudget"):
+        cur = criteria.get("budgetCurrency") or "USD"
+        bits.append(f"до {cur} {criteria['maxBudget']}")
+    return " · ".join(bits) or "Мой поиск"
+
+
+def _criteria_fingerprint(criteria: dict[str, Any]) -> str:
+    normalized = json.dumps(criteria, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+app = FastAPI(title="Property Intent Core", version="0.1.0")
+
+
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(engine)
+    # Tiny additive migrations keep the pilot deployable without destructive resets.
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_contact_id VARCHAR(80)"))
+        conn.execute(text("ALTER TABLE saved_searches ADD COLUMN IF NOT EXISTS crm_opportunity_id VARCHAR(80)"))
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "property-intent-core", "version": "0.1.0"}
+
+
+def _catalog_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "code": item.get("code"),
+        "operation": item.get("operation"),
+        "propertyType": item.get("propertyType"),
+        "address": item.get("address"),
+        "priceAmount": item.get("priceAmount"),
+        "priceCurrency": item.get("priceCurrency"),
+        "details": item.get("details") or {},
+        "highlightedFeatures": (item.get("highlightedFeatures") or [])[:5],
+        "description": "",
+        "notes": [],
+        "images": (item.get("images") or [])[:1],
+        "photoCount": len(item.get("images") or []),
+        "sourceUrl": item.get("sourceUrl"),
+        "neighborhoods": item.get("neighborhoods") or [],
+        "listingToken": item.get("listingToken"),
+    }
+
+
+@app.get("/v1/catalog")
+def catalog():
+    items = _catalog()
+    return {
+        "generatedAt": datetime.now(UTC).isoformat(),
+        "count": len(items),
+        "operations": {
+            "Venta": sum(1 for x in items if x.get("operation") == "Venta"),
+            "Alquiler": sum(1 for x in items if x.get("operation") == "Alquiler"),
+        },
+        "neighborhoods": sorted({hood for x in items for hood in x.get("neighborhoods", [])}),
+        "items": [_catalog_summary(item) for item in items],
+    }
+
+
+@app.get("/v1/catalog/{code}")
+def catalog_detail(code: str):
+    item = next((x for x in _catalog() if x.get("code") == code), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return {**item, "photoCount": len(item.get("images") or [])}
+
+
+@app.post("/v1/session")
+def session(body: SessionIn):
+    ctx = _validate_init_data(body.init_data)
+    user = ctx["user"]
+    return {"ok": True, "user": {"id": user["id"], "first_name": user.get("first_name"), "username": user.get("username")}}
+
+
+@app.post("/v1/events")
+def capture_event(body: EventIn):
+    allowed = {"catalog_opened", "listing_opened", "gallery_opened", "search_started", "search_submitted", "share_clicked"}
+    if body.event_name not in allowed:
+        raise HTTPException(status_code=422, detail="Unsupported event")
+    ctx = _validate_init_data(body.init_data)
+    item = next((x for x in _catalog() if x.get("code") == body.listing_code), None) if body.listing_code else None
+    start_param = str(ctx.get("start_param") or "")
+    link_token = start_param[4:] if start_param.startswith("trk_") else None
+    _growth_event(
+        int(ctx["user"]["id"]),
+        body.event_name,
+        listing_token=item.get("listingToken") if item else None,
+        properties=body.properties,
+        link_token=link_token,
+    )
+    return {"ok": True}
+
+
+@app.post("/v1/actions")
+def action(body: ActionIn):
+    ctx = _validate_init_data(body.init_data)
+    item = next((x for x in _catalog() if x.get("code") == body.listing_code), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    event_map = {
+        "availability": "availability_requested",
+        "viewing": "viewing_requested",
+        "question": "question_submitted",
+        "similar": "search_started",
+    }
+    event = event_map.get(body.action)
+    if not event:
+        raise HTTPException(status_code=422, detail="Unsupported action")
+    link = _ensure_link(
+        item,
+        source="telegram_miniapp",
+        medium="owned",
+        campaign="miniapp_catalog",
+        content=body.action,
+        placement="listing_detail",
+    )
+    _growth_event(
+        int(ctx["user"]["id"]),
+        event,
+        listing_token=item["listingToken"],
+        properties={"action": body.action},
+        link_token=(link or {}).get("token"),
+    )
+    fallback = f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
+    return {"ok": True, "telegram_url": (link or {}).get("telegram_url") or fallback}
+
+
+@app.get("/v1/saved-searches")
+def list_saved_searches(init_data: str = Query(...), session: Session = Depends(db)):
+    ctx = _validate_init_data(init_data)
+    user_id = int(ctx["user"]["id"])
+    rows = list(session.scalars(select(SavedSearch).where(
+        SavedSearch.tenant == settings.growth_tenant,
+        SavedSearch.telegram_user_id == user_id,
+        SavedSearch.active.is_(True),
+    ).order_by(SavedSearch.created_at.desc())))
+    return {"items": [{
+        "id": str(row.id),
+        "label": row.label,
+        "criteria": row.criteria_json,
+        "notify": row.notify,
+        "createdAt": row.created_at.isoformat(),
+    } for row in rows]}
+
+
+@app.post("/v1/saved-searches")
+def save_search(body: SavedSearchIn, session: Session = Depends(db)):
+    ctx = _validate_init_data(body.init_data)
+    user = ctx["user"]
+    user_id = int(user["id"])
+    criteria = body.criteria
+    if not any([
+        criteria.get("neighborhoods"),
+        criteria.get("maxBudget"),
+        criteria.get("rooms"),
+        criteria.get("bedrooms"),
+        criteria.get("propertyTypes"),
+        criteria.get("features"),
+        criteria.get("query"),
+    ]):
+        raise HTTPException(status_code=422, detail="Add at least one search criterion")
+    fp = _criteria_fingerprint(criteria)
+    row = session.scalar(select(SavedSearch).where(
+        SavedSearch.tenant == settings.growth_tenant,
+        SavedSearch.telegram_user_id == user_id,
+        SavedSearch.fingerprint == fp,
+    ))
+    now = datetime.now(UTC)
+    if row is None:
+        row = SavedSearch(
+            tenant=settings.growth_tenant,
+            telegram_user_id=user_id,
+            username=user.get("username"),
+            display_name=" ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or user.get("username"),
+            fingerprint=fp,
+            label=(body.label or _label(criteria))[:255],
+            criteria_json=criteria,
+            notify=body.notify,
+            active=True,
+        )
+        session.add(row)
+        session.flush()
+        # Existing inventory is the baseline. Only future listing versions can trigger a notification.
+        for item in _search(criteria):
+            session.add(SavedSearchMatch(
+                search_id=row.id,
+                listing_code=item.get("code") or "",
+                source_fingerprint=item.get("sourceFingerprint") or "",
+                first_seen_at=now,
+                notified_at=now,
+            ))
+    else:
+        row.notify = body.notify
+        row.active = True
+        row.updated_at = now
+        row.label = (body.label or row.label)[:255]
+    matches_now = len(_search(criteria))
+    session.flush()
+    if not _is_test_user(user_id):
+        _crm_sync_saved_search(row, user, matches_now)
+    session.commit()
+    _growth_event(user_id, "search_submitted", properties={"saved_search_id": str(row.id), "matches_now": matches_now})
+    if body.notify:
+        _growth_event(user_id, "notification_opt_in", properties={"saved_search_id": str(row.id)})
+    _growth_event(user_id, "lead_qualified", properties={"lead_kind": "saved_search", "saved_search_id": str(row.id)})
+    if settings.operator_chat_id and not _is_test_user(user_id):
+        who = f"@{user.get('username')}" if user.get("username") else (row.display_name or str(user_id))
+        _bot_send(
+            settings.operator_chat_id,
+            f"🔎 <b>Сохранённый поиск {settings.brand_name}</b>\n"
+            f"{who}\n{row.label}\n"
+            f"Сейчас в каталоге: {matches_now}\n"
+            f"Уведомления: {'да' if body.notify else 'нет'}",
+        )
+    return {"ok": True, "id": str(row.id), "label": row.label, "matches_now": matches_now, "notify": row.notify}
+
+
+@app.delete("/v1/saved-searches/{search_id}")
+def disable_search(search_id: UUID, init_data: str = Query(...), session: Session = Depends(db)):
+    ctx = _validate_init_data(init_data)
+    user_id = int(ctx["user"]["id"])
+    row = session.scalar(select(SavedSearch).where(
+        SavedSearch.id == search_id,
+        SavedSearch.tenant == settings.growth_tenant,
+        SavedSearch.telegram_user_id == user_id,
+    ))
+    if not row:
+        raise HTTPException(status_code=404, detail="Saved search not found")
+    row.active = False
+    row.updated_at = datetime.now(UTC)
+    session.commit()
+    return {"ok": True}
+
+
+@app.post("/v1/internal/rematch")
+def rematch(x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    if not x_intent_key or not hmac.compare_digest(x_intent_key, settings.service_key):
+        raise HTTPException(status_code=401, detail="Invalid intent key")
+    searches = list(session.scalars(select(SavedSearch).where(
+        SavedSearch.tenant == settings.growth_tenant,
+        SavedSearch.active.is_(True),
+        SavedSearch.notify.is_(True),
+    )))
+    notifications = 0
+    new_matches = 0
+    for search in searches:
+        unseen: list[dict[str, Any]] = []
+        for item in _search(search.criteria_json):
+            # Notify once per listing code. A photo/text/source-fingerprint refresh must
+            # not look like a new property. A listing that did not match before has no
+            # baseline row, so a later price/criteria change into range can still notify.
+            exists = session.scalar(select(SavedSearchMatch).where(
+                SavedSearchMatch.search_id == search.id,
+                SavedSearchMatch.listing_code == item.get("code"),
+            ))
+            if exists:
+                continue
+            row = SavedSearchMatch(
+                search_id=search.id,
+                listing_code=item.get("code") or "",
+                source_fingerprint=item.get("sourceFingerprint") or "",
+            )
+            session.add(row)
+            session.flush()
+            unseen.append(item)
+            new_matches += 1
+        if not unseen:
+            continue
+        chosen = unseen[:3]
+        lines = ["✨ <b>Появились новые варианты по вашему поиску</b>", search.label, ""]
+        keyboard = []
+        for item in chosen:
+            price = f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}".strip()
+            lines.append(f"• {item.get('address') or item.get('code')} · {price}")
+            link = _ensure_link(
+                item,
+                source="saved_search",
+                medium="owned",
+                campaign="reactivation",
+                content="new_match",
+                placement="telegram_notification",
+            )
+            url = (link or {}).get("telegram_url") or f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
+            keyboard.append([{"text": f"Открыть {item.get('code')}", "url": url}])
+        if len(unseen) > 3:
+            lines.append(f"\nИ ещё {len(unseen) - 3} новых.")
+        keyboard.append([{"text": "Открыть каталог", "web_app": {"url": settings.miniapp_url}}])
+        sent = _bot_send(search.telegram_user_id, "\n".join(lines), {"inline_keyboard": keyboard})
+        now = datetime.now(UTC)
+        if sent:
+            notifications += 1
+            search.last_notified_at = now
+            for item in unseen:
+                match = session.scalar(select(SavedSearchMatch).where(
+                    SavedSearchMatch.search_id == search.id,
+                    SavedSearchMatch.listing_code == item.get("code"),
+                    SavedSearchMatch.source_fingerprint == item.get("sourceFingerprint"),
+                ))
+                if match:
+                    match.notified_at = now
+            _growth_event(
+                search.telegram_user_id,
+                "notification_sent",
+                properties={"saved_search_id": str(search.id), "new_matches": len(unseen)},
+            )
+    session.commit()
+    return {"ok": True, "active_searches": len(searches), "new_matches": new_matches, "notifications": notifications}
