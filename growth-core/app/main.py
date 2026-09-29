@@ -470,6 +470,7 @@ def acquisition_metrics(
             func.coalesce(Event.campaign, "unknown"),
             func.count(func.distinct(Event.actor_key)),
             func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "bot_started"),
+            func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "catalog_opened"),
             func.count(Event.id).filter(Event.event_name == "listing_opened"),
             func.count(func.distinct(Event.actor_key)).filter(Event.event_name == "search_submitted"),
             func.count(Event.id).filter(Event.event_name == "share_clicked"),
@@ -511,10 +512,11 @@ def acquisition_metrics(
         bucket["clicks"] += int(clicks or 0)
 
     event_map: dict[tuple[str, str, str], dict[str, int]] = {}
-    for source, medium, campaign, people, starts, listings, searches, share_clicks, share_sends, availability, viewings, leads, wins in rows:
+    for source, medium, campaign, people, starts, catalog_opens, listings, searches, share_clicks, share_sends, availability, viewings, leads, wins in rows:
         event_map[(source, medium, campaign)] = {
             "people": int(people),
             "bot_starts": int(starts),
+            "catalog_opened": int(catalog_opens),
             "listing_opened": int(listings),
             "search_submitted": int(searches),
             "share_clicked": int(share_clicks),
@@ -534,6 +536,7 @@ def acquisition_metrics(
             {
                 "people": 0,
                 "bot_starts": 0,
+                "catalog_opened": 0,
                 "listing_opened": 0,
                 "search_submitted": 0,
                 "share_clicked": 0,
@@ -549,6 +552,8 @@ def acquisition_metrics(
         unit_currency = next(iter(currencies)) if len(currencies) == 1 else None
         amount = currencies.get(unit_currency, 0.0) if unit_currency else None
         people = metrics["people"]
+        starts = metrics["bot_starts"]
+        catalog_opens = metrics["catalog_opened"]
         leads = metrics["lead_qualified"]
         viewings = metrics["viewing_requested"]
         wins = metrics["deal_won"]
@@ -595,6 +600,7 @@ def dashboard(
                 r["campaign"],
                 r["people"],
                 r["bot_starts"],
+                r["catalog_opened"],
                 r["listing_opened"],
                 r["search_submitted"],
                 r["share_sent"],
@@ -612,7 +618,7 @@ def dashboard(
         )
         + "</tr>"
         for r in data["channels"]
-    ) or '<tr><td colspan="14" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
+    ) or '<tr><td colspan="15" class="empty">Пока нет production-событий. Это честный ноль, а не нарисованная аналитика.</td></tr>'
     steps = "".join(
         f'<div class="step"><b>{html.escape(s["event"])}</b><span>{s["people"]} чел.</span><small>{s["from_start_pct"] if s["from_start_pct"] is not None else "—"}% от старта</small></div>'
         for s in funnel["steps"]
@@ -646,7 +652,7 @@ th{{color:#6c727f;font-weight:600}}
 <div class="grid">{steps}</div>
 <div class="card">
 <table>
-<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Объекты</th><th>Поиск</th><th>Поделились</th><th>Лиды</th><th>Lead %</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
+<thead><tr><th>Источник</th><th>Тип</th><th>Кампания</th><th>Люди</th><th>Bot start</th><th>Mini App</th><th>Объекты</th><th>Поиск</th><th>Поделились</th><th>Лиды</th><th>Lead %</th><th>Запросы просмотра</th><th>Сделки</th><th>Расход</th><th>CPL</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </div>
