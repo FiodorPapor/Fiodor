@@ -440,6 +440,19 @@ async function editCaption(token: string, channel: string, entry: Entry, caption
     });
   }
 }
+async function deleteEntryMessages(token: string, channel: string, entry: Entry) {
+  const ids = [...(entry.messageIds || []), ...(entry.ctaMessageId ? [entry.ctaMessageId] : [])];
+  for (const messageId of ids) {
+    try {
+      await api(token, "deleteMessage", { chat_id: channel, message_id: messageId });
+    } catch (error) {
+      const text = String(error);
+      if (!/message to delete not found|message identifier is not specified/i.test(text)) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+}
+
 async function editLeadLink(token: string, channel: string, entry: Entry, item: Item, bot: string, leadUrl?: string, shareLeadUrl?: string) {
   const first = entry.messageIds[0];
   if (!first) return;
@@ -459,13 +472,6 @@ async function editLeadLink(token: string, channel: string, entry: Entry, item: 
     await editApi(token, "editMessageReplyMarkup", {
       chat_id: channel, message_id: first, reply_markup,
     });
-  }
-}
-async function deleteEntry(token: string, channel: string, entry: Entry) {
-  const ids = [...entry.messageIds, ...(entry.ctaMessageId ? [entry.ctaMessageId] : [])];
-  for (const id of ids) {
-    try { await api(token, "deleteMessage", { chat_id: channel, message_id: id }); }
-    catch (e) { console.warn(`delete ${id} skipped: ${String(e)}`); }
   }
 }
 async function readJson<T>(file: string, fallback: T): Promise<T> {
@@ -589,10 +595,18 @@ async function main() {
       if (apply) {
         try {
           const replacement = await postItem(token, channel, item, caption, bot, desiredThreadId, leadInfo.url, shareInfo.url);
+          const deleteToken = oldBot.replace(/^@/, "").toLowerCase() === bot.replace(/^@/, "").toLowerCase() ? token : legacyToken;
+          try {
+            await deleteEntryMessages(deleteToken, channel, old);
+          } catch (deleteError) {
+            // Roll back the replacement if the old publication could not be removed.
+            // Otherwise state would point only to the new copy and the old one would
+            // become an untracked duplicate in the public channel.
+            try { await deleteEntryMessages(token, channel, replacement); } catch {}
+            throw deleteError;
+          }
           state.entries[key] = { ...replacement, leadHash };
           await saveState(state);
-          const deleteToken = oldBot.replace(/^@/, "").toLowerCase() === bot.replace(/^@/, "").toLowerCase() ? token : legacyToken;
-          await deleteEntry(deleteToken, channel, old);
           console.log(`PROGRESS REPOST ${code}`);
           await new Promise(resolve => setTimeout(resolve, 500));
         } catch (error) {
@@ -640,18 +654,16 @@ async function main() {
   }
   for (const [key, old] of Object.entries(state.entries)) {
     if (current.has(key) || old.status === "removed" || failed.has(key)) continue;
-    const marked = `⛔️ <b>Объект снят с публикации</b>\n\n${old.caption}`.slice(0, 1000);
     actions.push(`REMOVE ${old.code}`);
     if (apply) {
-      await editCaption(token, channel, old, marked, { ...({} as Item), ...({ sourceUrl: old.sourceUrl, slug: old.code, code: old.code } as Item) }, bot);
-      const first = old.messageIds[0];
-      if (first) {
-        try { await api(token, "editMessageReplyMarkup", { chat_id: channel, message_id: first, reply_markup: { inline_keyboard: [] } }); } catch {}
-      }
-      if (old.ctaMessageId) {
-        try { await api(token, "editMessageText", { chat_id: channel, message_id: old.ctaMessageId, text: "⛔️ Объект снят с публикации", reply_markup: { inline_keyboard: [] } }); } catch {}
-      }
-      state.entries[key] = { ...old, status: "removed", caption: marked, textHash: hash(marked), updatedAt: new Date().toISOString() };
+      await deleteEntryMessages(token, channel, old);
+      state.entries[key] = {
+        ...old,
+        status: "removed",
+        messageIds: [],
+        ctaMessageId: undefined,
+        updatedAt: new Date().toISOString(),
+      };
       await saveState(state);
     }
     removed += 1;
