@@ -5,6 +5,40 @@ LOCK=/run/lock/lebleu-listing-sync.lock
 exec 9>"$LOCK"
 flock -n 9 || { echo "sync already running"; exit 0; }
 cd "$ROOT"
+
+drain_user_delete_queue() {
+  if ! python3 - <<'PY'
+import json
+from pathlib import Path
+p=Path("/opt/lebleu-listing-bridge/state/telegram-user-delete-queue.json")
+try:
+    raw=json.loads(p.read_text())
+except Exception:
+    raw=[]
+raise SystemExit(0 if isinstance(raw,list) and len(raw)>0 else 1)
+PY
+  then
+    return 0
+  fi
+
+  echo "[$(date -Is)] Telegram old-message cleanup via User API"
+  local was_active=0
+  if systemctl is-active --quiet intent-radar.service; then
+    was_active=1
+    systemctl stop intent-radar.service
+  fi
+  local rc=0
+  timeout 90s /opt/intent-radar/venv/bin/python scripts/drain-user-delete-queue.py || rc=$?
+  if [[ "$was_active" -eq 1 ]]; then
+    systemctl start intent-radar.service
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    echo "[$(date -Is)] ERROR Telegram user-delete queue was not fully drained"
+    return "$rc"
+  fi
+}
+
+drain_user_delete_queue
 echo "[$(date -Is)] scan start"
 npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @LeBleuArgentinaBot --chat-id @PREVIEW_ONLY
 
@@ -28,6 +62,7 @@ if ! timeout 600s npx tsx scripts/telegram-publisher.ts --apply; then
   echo "[$(date -Is)] ERROR telegram publisher failed or exceeded 10 minutes"
   exit 1
 fi
+drain_user_delete_queue
 
 # Saved-search reactivation is deliberately a soft dependency: catalogue sync must
 # never fail because the notification service is unavailable.
