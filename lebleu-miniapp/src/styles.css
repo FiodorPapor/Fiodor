@@ -36,3 +36,45 @@ button:disabled{opacity:.55;cursor:default}
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes fade{from{opacity:0}}@keyframes up{from{transform:translateY(20px)}}
 @media(min-width:660px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.content{padding-top:27px}.detailActions{left:50%;right:auto;transform:translateX(-50%);width:min(760px,100%)}.sheet{max-width:560px;margin:0 auto}.overlay{align-items:center}.sheet{border-radius:22px;max-height:82vh;padding-bottom:18px}.sheet.tall{height:min(78vh,720px)}.detail .gallery{max-width:760px;margin:auto}.slide{aspect-ratio:16/10}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* 2026-09-30 modern search/map layer */
+button,input,select,textarea{font:inherit;color:inherit}
+.resultHeader{gap:10px;align-items:center}.resultCount{white-space:nowrap}
+.resultActions{display:flex;align-items:center;gap:7px;min-width:0}
+.sortSelect{max-width:190px;height:36px;padding:0 28px 0 10px;border:1px solid var(--stroke);border-radius:11px;background:var(--secondary);font-size:11px;font-weight:700;outline:0}
+.viewToggle{display:grid;grid-template-columns:38px 38px;padding:3px;border-radius:12px;background:var(--secondary);border:1px solid var(--stroke)}
+.viewToggle button{height:32px;border-radius:9px;background:transparent;color:var(--hint);display:grid;place-items:center}
+.viewToggle button.active{background:var(--bg);color:var(--text);box-shadow:0 1px 6px rgba(0,0,0,.1)}
+.activeSummary{display:flex;justify-content:space-between;align-items:center;margin:-3px 2px 10px;color:var(--hint);font-size:11px}
+.activeSummary button{padding:5px 0;background:transparent;color:var(--link);font-size:11px;font-weight:750}
+.filterSheet{height:min(91vh,820px);display:flex;flex-direction:column}
+.filterSheet .sheetScroll{min-height:0;flex:1}
+.currencyTabs{display:inline-grid;grid-template-columns:1fr 1fr;gap:3px;padding:3px;margin-bottom:9px;border-radius:11px;background:var(--secondary)}
+.currencyTabs button{min-width:72px;height:34px;border-radius:8px;background:transparent;color:var(--hint);font-size:12px;font-weight:750}
+.currencyTabs button.active{background:var(--bg);color:var(--text);box-shadow:0 1px 5px rgba(0,0,0,.08)}
+.rangeInputs{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.rangeInputs input,.questionInput{width:100%;border:1px solid var(--stroke);background:var(--secondary);outline:0}
+.rangeInputs input{height:45px;border-radius:12px;padding:0 12px}
+.rangeInputs input:focus,.questionInput:focus{border-color:color-mix(in srgb,var(--button) 55%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--button) 12%,transparent)}
+.splitFilter{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.miniChoice{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:5px}
+.miniChoice button{height:38px;border-radius:10px;background:var(--secondary);font-size:12px;font-weight:750}
+.miniChoice button.active{background:var(--button);color:var(--buttonText)}
+.questionInput{resize:none;border-radius:14px;padding:12px;line-height:1.45;min-height:122px}
+.successSheet{text-align:center;padding-top:22px}.successSheet h3{margin:12px 0 6px;font-size:19px}.successSheet p{margin:0;color:var(--hint);font-size:13px;line-height:1.45}
+.successIcon{width:54px;height:54px;margin:auto;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--button) 14%,var(--bg));color:var(--button)}
+.mapShell{position:relative;height:max(430px,calc(100vh - 340px));min-height:430px;border:1px solid var(--stroke);border-radius:18px;overflow:hidden;background:var(--secondary);box-shadow:0 2px 12px rgba(0,0,0,.04)}
+.catalogMap{position:absolute;inset:0}.mapLoading{height:430px;display:flex;align-items:center;justify-content:center;gap:11px;border-radius:18px;background:var(--secondary);color:var(--hint);font-size:13px}
+.priceMarker{min-width:48px;height:30px;padding:0 8px;border:2px solid #fff;border-radius:999px;background:#176b58;color:#fff;font-size:11px;font-weight:850;box-shadow:0 3px 12px rgba(0,0,0,.26);white-space:nowrap;transform:scale(1);transition:transform .12s ease}
+.priceMarker:active{transform:scale(.94)}
+.mapHint{position:absolute;left:50%;bottom:13px;transform:translateX(-50%);padding:7px 10px;border-radius:999px;background:rgba(20,23,27,.78);color:#fff;font-size:10px;font-weight:700;white-space:nowrap;backdrop-filter:blur(8px)}
+.mapEmpty{position:absolute;inset:0;display:grid;place-items:center;padding:30px;text-align:center;color:var(--hint);font-size:13px;background:var(--secondary)}
+.maplibregl-ctrl-top-right{top:8px;right:8px}.maplibregl-ctrl-group{border-radius:12px!important;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.12)!important}.maplibregl-ctrl button{width:34px!important;height:34px!important}
+.detailSection p{max-width:68ch}.detailSection h2{letter-spacing:-.01em}
+@media(max-width:420px){
+  .resultHeader{align-items:flex-start;flex-direction:column}
+  .resultActions{width:100%}.sortSelect{flex:1;max-width:none}.viewToggle{flex:0 0 auto}
+  .splitFilter{grid-template-columns:1fr;gap:12px}.mapShell{height:calc(100vh - 310px);min-height:420px}
+}
+
+.filterSheet{max-height:91vh}
