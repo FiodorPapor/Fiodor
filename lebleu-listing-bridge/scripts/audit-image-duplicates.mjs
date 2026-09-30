@@ -85,6 +85,7 @@ const report={
   failed:results.filter(x=>x.error).length,
   withinNearDuplicates:within,
   crossExactHashGroups:cross,
+  imageHashes:results,
 };
 fs.writeFileSync("/tmp/lebleu-image-audit.json",JSON.stringify(report,null,2));
 console.log(JSON.stringify({
