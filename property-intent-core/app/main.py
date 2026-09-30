@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     crm_webhook_url: str = ""
     crm_webhook_secret: str = ""
     catalog_path: str = "/data/catalog.json"
+    catalog_alias_path: str = "/data/catalog-aliases.json"
     quality_path: str = "/data/quality.json"
     geo_enrichment_path: str = "/data/geo-enrichment.json"
     caba_barrios_path: str = "/srv/data/reference/caba-barrios.geojson"
@@ -184,6 +185,46 @@ LOCATION_PARENT = {
     "nordelta": "tigre",
 }
 
+PROPERTY_TYPE_RU = {
+    "Departamento": "Квартира",
+    "Casa": "Дом",
+    "PH": "PH",
+    "Cochera": "Парковочное место",
+    "Local Comercial": "Коммерческое помещение",
+    "Local": "Коммерческое помещение",
+    "Terreno o Lote": "Участок",
+    "Terreno": "Участок",
+    "Oficina": "Офис",
+    "Depósito": "Склад",
+}
+
+FEATURE_RU = {
+    "balcón": "балкон",
+    "balcon": "балкон",
+    "pileta": "бассейн",
+    "piscina": "бассейн",
+    "parrilla": "зона барбекю",
+    "cochera": "парковочное место",
+    "amoblado": "меблировка",
+    "laundry": "прачечная",
+    "aire acondicionado": "кондиционер",
+    "terraza": "терраса",
+    "jardín": "сад",
+    "jardin": "сад",
+    "gimnasio": "спортзал",
+    "patio": "патио",
+    "sum": "общий зал",
+    "solarium": "солярий",
+    "baulera": "кладовая",
+    "quincho": "крытая зона барбекю",
+    "apto crédito": "подходит под ипотеку",
+    "apto credito": "подходит под ипотеку",
+    "apto profesional": "подходит для профессионального использования",
+    "calefacción": "отопление",
+    "calefaccion": "отопление",
+}
+
+
 FEATURE_ALIASES = {
     "balcon": ["balcón", "balcon"],
     "pileta": ["pileta", "piscina"],
@@ -193,6 +234,16 @@ FEATURE_ALIASES = {
     "laundry": ["laundry", "lavadero"],
     "aire": ["aire acondicionado"],
     "terraza": ["terraza"],
+    "jardin": ["jardín", "jardin"],
+    "gimnasio": ["gimnasio", "gym"],
+    "patio": ["patio"],
+    "sum": ["sum"],
+    "solarium": ["solarium"],
+    "baulera": ["baulera"],
+    "quincho": ["quincho"],
+    "apto_credito": ["apto crédito", "apto credito"],
+    "apto_profesional": ["apto profesional"],
+    "calefaccion": ["calefacción", "calefaccion"],
 }
 
 
@@ -220,6 +271,7 @@ class ActionIn(BaseModel):
     init_data: str
     listing_code: str
     action: str
+    message: str | None = Field(default=None, max_length=2000)
     link_token: str | None = Field(default=None, max_length=24)
 
 
@@ -308,6 +360,35 @@ def _load_json(path: str, fallback: Any):
         return fallback
 
 
+def _structured_ru_fallback(src: dict[str, Any], details: dict[str, Any], property_type: str | None) -> str:
+    title = PROPERTY_TYPE_RU.get(str(property_type or ""), "Объект недвижимости")
+    address = str(src.get("address") or "").strip()
+    parts = [f"{title}{f' по адресу {address}' if address else ''}."]
+    area = details.get("totalAreaM2") or details.get("coveredAreaM2")
+    facts: list[str] = []
+    if area:
+        facts.append(f"площадь {area:g} м²" if isinstance(area, (int, float)) else f"площадь {area} м²")
+    if details.get("rooms"):
+        facts.append(f"{details['rooms']} комн.")
+    if details.get("bedrooms"):
+        facts.append(f"{details['bedrooms']} спальн.")
+    if details.get("bathrooms"):
+        facts.append(f"{details['bathrooms']} ванн.")
+    if details.get("parkingSpaces"):
+        facts.append(f"парковочных мест: {details['parkingSpaces']}")
+    if facts:
+        parts.append("Основные параметры: " + ", ".join(facts) + ".")
+    feature_names: list[str] = []
+    for raw in src.get("highlightedFeatures") or []:
+        translated = FEATURE_RU.get(str(raw).strip().lower())
+        if translated and translated not in feature_names:
+            feature_names.append(translated)
+    if feature_names:
+        parts.append("Особенности: " + ", ".join(feature_names[:8]) + ".")
+    parts.append("Описание сформировано по структурированным данным исходного объявления Le Bleu.")
+    return " ".join(parts)
+
+
 _catalog_cache: dict[str, Any] = {
     "mtime": 0.0,
     "quality_mtime": 0.0,
@@ -354,7 +435,7 @@ def _catalog() -> list[dict[str, Any]]:
             "priceCurrency": src.get("priceCurrency"),
             "details": details,
             "highlightedFeatures": src.get("highlightedFeatures") or [],
-            "description": (q.get("summary_ru") if current else None) or src.get("description") or "",
+            "description": (q.get("summary_ru") if current else None) or _structured_ru_fallback(src, details, ptype),
             "notes": (q.get("notes_ru") if current else []) or [],
             # Keep the complete source gallery for the detail endpoint. The
             # catalogue summary below still returns only the first image, so list
@@ -383,6 +464,27 @@ def _listing_token(item: dict[str, Any]) -> str:
     source = str(item.get("sourceUrl") or "")
     suffix = hashlib.sha256(source.encode()).hexdigest()[:8]
     return f"{item.get('code')}_{suffix}"
+
+
+def _listing_by_key(key: str | None) -> dict[str, Any] | None:
+    lookup = str(key or "")
+    if not lookup:
+        return None
+    items = _catalog()
+    # Unique source-bound token is authoritative.
+    item = next((x for x in items if x.get("listingToken") == lookup), None)
+    if item:
+        return item
+    alias_payload = _load_json(settings.catalog_alias_path, {})
+    aliases = alias_payload.get("aliases", {}) if isinstance(alias_payload, dict) else {}
+    canonical = aliases.get(lookup) if isinstance(aliases, dict) else None
+    if canonical:
+        item = next((x for x in items if x.get("listingToken") == canonical), None)
+        if item:
+            return item
+    # Plain code remains a backwards-compatible fallback. Some source codes are
+    # reused for sale + rent, so new links must always use listingToken.
+    return next((x for x in items if x.get("code") == lookup), None)
 
 
 def _listing_neighborhoods(item: dict[str, Any]) -> list[str]:
@@ -468,17 +570,30 @@ def _match(item: dict[str, Any], criteria: dict[str, Any]) -> bool:
     bedrooms = criteria.get("bedrooms")
     if bedrooms and int(d.get("bedrooms") or 0) != int(bedrooms):
         return False
+    min_bedrooms = criteria.get("minBedrooms")
+    if min_bedrooms and int(d.get("bedrooms") or 0) < int(min_bedrooms):
+        return False
+    min_bathrooms = criteria.get("minBathrooms")
+    if min_bathrooms and int(d.get("bathrooms") or 0) < int(min_bathrooms):
+        return False
+    if criteria.get("parking") and int(d.get("parkingSpaces") or 0) < 1:
+        return False
     min_area = _safe_num(criteria.get("minArea"))
     if min_area and _safe_num(d.get("totalAreaM2") or d.get("coveredAreaM2") or 0) < min_area:
         return False
     max_area = _safe_num(criteria.get("maxArea"))
     if max_area and _safe_num(d.get("totalAreaM2") or d.get("coveredAreaM2") or 0) > max_area:
         return False
-    budget = _safe_num(criteria.get("maxBudget"))
+    min_budget = _safe_num(criteria.get("minBudget"))
+    max_budget = _safe_num(criteria.get("maxBudget"))
     currency = criteria.get("budgetCurrency")
-    if budget:
+    if min_budget or max_budget:
         price = _safe_num(item.get("priceAmount"))
-        if not price or item.get("priceCurrency") != currency or price > budget:
+        if not price or item.get("priceCurrency") != currency:
+            return False
+        if min_budget and price < min_budget:
+            return False
+        if max_budget and price > max_budget:
             return False
     blob = _listing_blob(item)
     for feature in criteria.get("features") or []:
@@ -773,6 +888,41 @@ def _crm_post(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+def _crm_get(path: str) -> dict[str, Any] | None:
+    base = settings.crm_base_url.rstrip("/")
+    if not base or not settings.crm_api_key:
+        return None
+    try:
+        response = httpx.get(
+            f"{base}{path}",
+            headers={"X-API-Key": settings.crm_api_key},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _crm_patch(path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    base = settings.crm_base_url.rstrip("/")
+    if not base or not settings.crm_api_key:
+        return None
+    try:
+        response = httpx.patch(
+            f"{base}{path}",
+            json=payload,
+            headers={"X-API-Key": settings.crm_api_key},
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: int) -> None:
     if not settings.crm_base_url or not settings.crm_api_key:
         return
@@ -831,6 +981,121 @@ def _crm_sync_saved_search(row: SavedSearch, user: dict[str, Any], matches_now: 
         )
         if opportunity and opportunity.get("id"):
             row.crm_opportunity_id = str(opportunity["id"])
+
+
+def _crm_sync_listing_action(
+    user: dict[str, Any],
+    item: dict[str, Any],
+    action: str,
+    message: str | None,
+    tracking_token: str | None,
+) -> str | None:
+    if not settings.crm_base_url or not settings.crm_api_key:
+        return None
+    user_id = int(user["id"])
+    display_name = " ".join(
+        part for part in [user.get("first_name"), user.get("last_name")] if part
+    ) or user.get("username") or f"Telegram {user_id}"
+    contact = _crm_post(
+        "/v1/contacts/upsert",
+        {
+            "display_name": display_name,
+            "identity": {
+                "channel": "telegram",
+                "value": str(user_id),
+                "external_id": str(user_id),
+                "verified": True,
+                "is_primary": True,
+            },
+            "preferred_language": "ru",
+            "relationship_stage": "lead",
+            "priority": "high" if action == "viewing" else "medium",
+            "summary_current": (
+                f"{settings.brand_name} Mini App. Интерес к объекту "
+                f"{item.get('address') or item.get('code')}"
+            ),
+        },
+    )
+    if not contact or not contact.get("id"):
+        return None
+    contact_id = str(contact["id"])
+    attribution = _growth_link(tracking_token) or {}
+    action_label = {
+        "availability": "Проверить актуальность",
+        "viewing": "Запрос просмотра",
+        "question": "Вопрос по объекту",
+    }.get(action, action)
+    next_action = {
+        "availability": "Проверить актуальность объекта и ответить клиенту в Telegram",
+        "viewing": "Связаться с клиентом и согласовать просмотр",
+        "question": "Ответить на вопрос клиента по объекту",
+    }.get(action, "Связаться с клиентом")
+    probability = {"availability": 70, "viewing": 85, "question": 65}.get(action, 60)
+    clean_message = (message or "").strip()
+    summary = (
+        f"{action_label}: {item.get('address') or item.get('code')} · "
+        f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}"
+    )
+    if clean_message:
+        summary += f". Вопрос: {clean_message}"
+    extra = {
+        "listing_token": item.get("listingToken"),
+        "listing_code": item.get("code"),
+        "listing_source_url": item.get("sourceUrl"),
+        "action": action,
+        "message": clean_message or None,
+        "telegram_user_id": user_id,
+        "telegram_username": user.get("username"),
+        "tracking_token": tracking_token,
+        "tracking_source": attribution.get("source"),
+        "tracking_medium": attribution.get("medium"),
+        "tracking_campaign": attribution.get("campaign"),
+        "tracking_content": attribution.get("content"),
+        "tracking_placement": attribution.get("placement"),
+    }
+
+    existing_payload = _crm_get(
+        "/v1/opportunities?"
+        + urlencode({"contact_id": contact_id, "limit": 200, "offset": 0})
+    ) or {}
+    existing = next(
+        (
+            row for row in existing_payload.get("items", [])
+            if row.get("source") == settings.crm_source
+            and (row.get("extra_json") or {}).get("listing_token") == item.get("listingToken")
+            and row.get("stage") not in {"won", "lost"}
+        ),
+        None,
+    )
+    if existing and existing.get("id"):
+        merged_extra = dict(existing.get("extra_json") or {})
+        merged_extra.update(extra)
+        updated = _crm_patch(
+            f"/v1/opportunities/{existing['id']}",
+            {
+                "probability": max(int(existing.get("probability") or 0), probability),
+                "next_action": next_action,
+                "summary_current": summary,
+                "extra_json": merged_extra,
+            },
+        )
+        return str((updated or existing).get("id") or "") or None
+
+    opportunity = _crm_post(
+        "/v1/opportunities",
+        {
+            "name": f"{settings.brand_name} · {action_label} · {item.get('address') or item.get('code')}"[:255],
+            "type": "real_estate_lead",
+            "stage": "qualifying",
+            "contact_id": contact_id,
+            "probability": probability,
+            "source": settings.crm_source,
+            "next_action": next_action,
+            "summary_current": summary,
+            "extra_json": extra,
+        },
+    )
+    return str((opportunity or {}).get("id") or "") or None
 
 
 def _saved_search_webhook_payload(
@@ -916,9 +1181,19 @@ def _label(criteria: dict[str, Any]) -> str:
         bits.append(", ".join(x.title() for x in hoods[:3]))
     if criteria.get("rooms"):
         bits.append(f"{criteria['rooms']} комн.")
+    elif criteria.get("minBedrooms"):
+        bits.append(f"от {criteria['minBedrooms']} спальн.")
+    if criteria.get("minArea"):
+        bits.append(f"от {criteria['minArea']} м²")
     if criteria.get("maxBudget"):
         cur = criteria.get("budgetCurrency") or "USD"
-        bits.append(f"до {cur} {criteria['maxBudget']}")
+        if criteria.get("minBudget"):
+            bits.append(f"{cur} {criteria['minBudget']}–{criteria['maxBudget']}")
+        else:
+            bits.append(f"до {cur} {criteria['maxBudget']}")
+    elif criteria.get("minBudget"):
+        cur = criteria.get("budgetCurrency") or "USD"
+        bits.append(f"от {cur} {criteria['minBudget']}")
     return " · ".join(bits) or "Мой поиск"
 
 
@@ -965,13 +1240,15 @@ def _catalog_summary(item: dict[str, Any]) -> dict[str, Any]:
         "priceAmount": item.get("priceAmount"),
         "priceCurrency": item.get("priceCurrency"),
         "details": item.get("details") or {},
-        "highlightedFeatures": (item.get("highlightedFeatures") or [])[:5],
-        "description": "",
+        "highlightedFeatures": (item.get("highlightedFeatures") or [])[:8],
+        "description": str(item.get("description") or "")[:480],
         "notes": [],
         "images": (item.get("images") or [])[:1],
         "photoCount": len(item.get("images") or []),
         "sourceUrl": item.get("sourceUrl"),
         "neighborhoods": item.get("neighborhoods") or [],
+        "latitude": item.get("latitude"),
+        "longitude": item.get("longitude"),
         "listingToken": item.get("listingToken"),
     }
 
@@ -993,13 +1270,7 @@ def catalog():
 
 @app.get("/v1/catalog/{code}")
 def catalog_detail(code: str):
-    item = next(
-        (
-            x for x in _catalog()
-            if x.get("listingToken") == code or x.get("code") == code
-        ),
-        None,
-    )
+    item = _listing_by_key(code)
     if not item:
         raise HTTPException(status_code=404, detail="Listing not found")
     return {**item, "photoCount": len(item.get("images") or [])}
@@ -1027,13 +1298,7 @@ def capture_event(body: EventIn):
     if body.event_name not in allowed:
         raise HTTPException(status_code=422, detail="Unsupported event")
     ctx = _validate_init_data(body.init_data)
-    item = next(
-        (
-            x for x in _catalog()
-            if x.get("listingToken") == body.listing_code or x.get("code") == body.listing_code
-        ),
-        None,
-    ) if body.listing_code else None
+    item = _listing_by_key(body.listing_code) if body.listing_code else None
     link_token = _tracking_token(body.link_token, ctx)
     user_id = int(ctx["user"]["id"])
     _growth_event(
@@ -1059,13 +1324,7 @@ def capture_event(body: EventIn):
 @app.post("/v1/actions")
 def action(body: ActionIn):
     ctx = _validate_init_data(body.init_data)
-    item = next(
-        (
-            x for x in _catalog()
-            if x.get("listingToken") == body.listing_code or x.get("code") == body.listing_code
-        ),
-        None,
-    )
+    item = _listing_by_key(body.listing_code)
     if not item:
         raise HTTPException(status_code=404, detail="Listing not found")
     acquisition_token = _tracking_token(body.link_token, ctx)
@@ -1109,11 +1368,13 @@ def action(body: ActionIn):
         "availability": "availability_requested",
         "viewing": "viewing_requested",
         "question": "question_submitted",
-        "similar": "search_started",
     }
     event = event_map.get(body.action)
     if not event:
         raise HTTPException(status_code=422, detail="Unsupported action")
+    clean_message = (body.message or "").strip()
+    if body.action == "question" and not clean_message:
+        raise HTTPException(status_code=422, detail="Напишите вопрос")
     attribution = _growth_link(acquisition_token) if acquisition_token else None
     link = _ensure_link(
         item,
@@ -1130,8 +1391,50 @@ def action(body: ActionIn):
         properties={"action": body.action},
         link_token=(link or {}).get("token"),
     )
-    fallback = f"https://t.me/{settings.telegram_bot_username}?start=lb_{item['listingToken']}"
-    return {"ok": True, "telegram_url": (link or {}).get("telegram_url") or fallback}
+    opportunity_id = None
+    if not _is_test_user(user_id):
+        opportunity_id = _crm_sync_listing_action(
+            ctx["user"],
+            item,
+            body.action,
+            clean_message or None,
+            acquisition_token,
+        )
+        action_label = {
+            "availability": "проверка актуальности",
+            "viewing": "просмотр",
+            "question": "вопрос",
+        }[body.action]
+        username = ctx["user"].get("username")
+        who = f"@{username}" if username else f"Telegram {user_id}"
+        operator_text = (
+            f"🏠 Le Bleu Mini App · {action_label}\n"
+            f"{who}\n"
+            f"{item.get('address') or item.get('code')} · "
+            f"{item.get('priceCurrency') or ''} {item.get('priceAmount') or ''}"
+        )
+        if clean_message:
+            operator_text += f"\n\n{clean_message}"
+        if opportunity_id:
+            operator_text += f"\n\nCRM: {opportunity_id}"
+        if settings.operator_chat_id:
+            _bot_send(settings.operator_chat_id, operator_text)
+        confirmation = {
+            "availability": "Запрос получили. Проверим актуальность объекта и ответим вам здесь в Telegram.",
+            "viewing": "Запрос на просмотр получили. Свяжемся с вами здесь в Telegram, чтобы согласовать время.",
+            "question": "Вопрос получили. Ответим вам здесь в Telegram.",
+        }[body.action]
+        _bot_send(user_id, confirmation)
+    return {
+        "ok": True,
+        "status": "submitted",
+        "opportunity_id": opportunity_id,
+        "message": {
+            "availability": "Запрос на проверку актуальности отправлен",
+            "viewing": "Запрос на просмотр отправлен",
+            "question": "Вопрос отправлен",
+        }[body.action],
+    }
 
 
 @app.get("/v1/saved-searches")
@@ -1161,9 +1464,15 @@ def save_search(body: SavedSearchIn, session: Session = Depends(db)):
     criteria = body.criteria
     if not any([
         criteria.get("neighborhoods"),
+        criteria.get("minBudget"),
         criteria.get("maxBudget"),
         criteria.get("rooms"),
         criteria.get("bedrooms"),
+        criteria.get("minBedrooms"),
+        criteria.get("minBathrooms"),
+        criteria.get("parking"),
+        criteria.get("minArea"),
+        criteria.get("maxArea"),
         criteria.get("propertyTypes"),
         criteria.get("features"),
         criteria.get("query"),
