@@ -2,21 +2,26 @@ import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {
   ArrowLeft, Bell, Bookmark, Building2, Check, ChevronRight,
-  MapPin, MessageCircle, Search, Share2, SlidersHorizontal, X
+  List, Map as MapIcon, MapPin, MessageCircle, Search, Share2, SlidersHorizontal, X
 } from 'lucide-react';
 import './styles.css';
+
+const CatalogMap=React.lazy(()=>import('./CatalogMap'));
 
 type Listing = {
   code:string; operation:string; propertyType:string; address:string;
   priceAmount:string; priceCurrency:string; details:Record<string,number>;
   highlightedFeatures:string[]; description:string; notes:string[];
   images:string[]; photoCount:number; sourceUrl:string; neighborhoods:string[]; listingToken:string;
+  latitude?:number|null; longitude?:number|null;
 };
 type Catalog = {count:number; operations:Record<string,number>; neighborhoods:string[]; items:Listing[]};
 type PublicConfig = {brandName:string; brandTagline:string; botUsername:string};
 type Filters = {
   operation:string; query:string; neighborhoods:string[]; propertyTypes:string[];
-  rooms:number|null; maxBudget:string; budgetCurrency:string;
+  rooms:number|null; bedrooms:number|null; bathrooms:number|null; parking:boolean;
+  minBudget:string; maxBudget:string; budgetCurrency:string;
+  minArea:string; maxArea:string; features:string[]; sort:string;
 };
 type SavedSearch = {id:string; label:string; criteria:Record<string,unknown>; notify:boolean; createdAt:string};
 
@@ -64,37 +69,81 @@ function spec(item:Listing){
   return rows.join(' · ');
 }
 function filtersToCriteria(f:Filters){
+  const hasBudget=Boolean(f.minBudget||f.maxBudget);
   return {
     operation:f.operation||undefined,
     query:f.query.trim()||undefined,
     neighborhoods:f.neighborhoods,
     propertyTypes:f.propertyTypes,
     rooms:f.rooms||undefined,
+    minBedrooms:f.bedrooms||undefined,
+    minBathrooms:f.bathrooms||undefined,
+    parking:f.parking||undefined,
+    minBudget:f.minBudget?Number(f.minBudget):undefined,
     maxBudget:f.maxBudget?Number(f.maxBudget):undefined,
-    budgetCurrency:f.maxBudget?f.budgetCurrency:undefined,
+    budgetCurrency:hasBudget?f.budgetCurrency:undefined,
+    minArea:f.minArea?Number(f.minArea):undefined,
+    maxArea:f.maxArea?Number(f.maxArea):undefined,
+    features:f.features,
   };
 }
 function criteriaToFilters(criteria:Record<string,unknown>):Filters{
   const neighborhoods=Array.isArray(criteria.neighborhoods)?criteria.neighborhoods.map(String):[];
   const propertyTypes=Array.isArray(criteria.propertyTypes)?criteria.propertyTypes.map(String):[];
+  const features=Array.isArray(criteria.features)?criteria.features.map(String):[];
   return {
     operation:typeof criteria.operation==='string'?criteria.operation:'',
     query:typeof criteria.query==='string'?criteria.query:'',
     neighborhoods,
     propertyTypes,
     rooms:criteria.rooms?Number(criteria.rooms):null,
+    bedrooms:criteria.minBedrooms?Number(criteria.minBedrooms):criteria.bedrooms?Number(criteria.bedrooms):null,
+    bathrooms:criteria.minBathrooms?Number(criteria.minBathrooms):null,
+    parking:Boolean(criteria.parking),
+    minBudget:criteria.minBudget?String(criteria.minBudget):'',
     maxBudget:criteria.maxBudget?String(criteria.maxBudget):'',
     budgetCurrency:typeof criteria.budgetCurrency==='string'?criteria.budgetCurrency:'USD',
+    minArea:criteria.minArea?String(criteria.minArea):'',
+    maxArea:criteria.maxArea?String(criteria.maxArea):'',
+    features,
+    sort:'recommended',
   };
 }
 function activeFilterCount(f:Filters){
-  return (f.operation?1:0)+(f.query?1:0)+f.neighborhoods.length+f.propertyTypes.length+(f.rooms?1:0)+(f.maxBudget?1:0);
+  return (f.operation?1:0)+(f.query?1:0)+f.neighborhoods.length+f.propertyTypes.length+
+    (f.rooms?1:0)+(f.bedrooms?1:0)+(f.bathrooms?1:0)+(f.parking?1:0)+
+    (f.minBudget||f.maxBudget?1:0)+(f.minArea||f.maxArea?1:0)+f.features.length;
 }
 function canSaveSearch(f:Filters){
-  return Boolean(f.query.trim()||f.neighborhoods.length||f.propertyTypes.length||f.rooms||f.maxBudget);
+  return Boolean(
+    f.query.trim()||f.neighborhoods.length||f.propertyTypes.length||f.rooms||f.bedrooms||
+    f.bathrooms||f.parking||f.minBudget||f.maxBudget||f.minArea||f.maxArea||f.features.length
+  );
 }
 function normalizedSearch(value:string){
   return value.toLowerCase().replace(/ё/g,'е').replace(/[^a-záéíóúñüа-я0-9]+/gi,' ').trim();
+}
+const FEATURE_OPTIONS=[
+  {key:'balcon',label:'Балкон',terms:['balcón','balcon']},
+  {key:'pileta',label:'Бассейн',terms:['pileta','piscina']},
+  {key:'parrilla',label:'Гриль / parrilla',terms:['parrilla']},
+  {key:'cochera',label:'Парковка',terms:['cochera','garage','garaje']},
+  {key:'terraza',label:'Терраса',terms:['terraza']},
+  {key:'jardin',label:'Сад',terms:['jardín','jardin']},
+  {key:'gimnasio',label:'Спортзал',terms:['gimnasio','gym']},
+  {key:'laundry',label:'Прачечная',terms:['laundry','lavadero']},
+  {key:'aire',label:'Кондиционер',terms:['aire acondicionado']},
+  {key:'amoblado',label:'Меблирована',terms:['amoblado','amueblado']},
+  {key:'apto_credito',label:'Подходит под ипотеку',terms:['apto crédito','apto credito']},
+  {key:'apto_profesional',label:'Для проф. использования',terms:['apto profesional']},
+  {key:'baulera',label:'Кладовая',terms:['baulera']},
+  {key:'sum',label:'SUM',terms:['sum']},
+];
+function itemHasFeature(item:Listing,key:string){
+  const option=FEATURE_OPTIONS.find(x=>x.key===key);
+  if(!option)return false;
+  const hay=normalizedSearch([...(item.highlightedFeatures||[]),item.description||''].join(' '));
+  return option.terms.some(term=>hay.includes(normalizedSearch(term)));
 }
 function listingKey(item:Listing){
   return item.listingToken||item.code;
@@ -110,7 +159,10 @@ async function ensureWriteAccess(){
 }
 
 const DEFAULT_FILTERS:Filters={
-  operation:'',query:'',neighborhoods:[],propertyTypes:[],rooms:null,maxBudget:'',budgetCurrency:'USD'
+  operation:'',query:'',neighborhoods:[],propertyTypes:[],
+  rooms:null,bedrooms:null,bathrooms:null,parking:false,
+  minBudget:'',maxBudget:'',budgetCurrency:'USD',
+  minArea:'',maxArea:'',features:[],sort:'recommended'
 };
 const DEFAULT_CONFIG:PublicConfig={brandName:'Каталог',brandTagline:'Недвижимость',botUsername:''};
 function brandInitials(name:string){
@@ -131,6 +183,10 @@ function App(){
   const [saved,setSaved]=useState<SavedSearch[]>([]);
   const [toast,setToast]=useState('');
   const [busy,setBusy]=useState(false);
+  const [viewMode,setViewMode]=useState<'list'|'map'>('list');
+  const [questionOpen,setQuestionOpen]=useState(false);
+  const [questionText,setQuestionText]=useState('');
+  const [actionSuccess,setActionSuccess]=useState('');
   const searchStarted=useRef(false);
 
   useEffect(()=>{
@@ -177,11 +233,13 @@ function App(){
       else if(filtersOpen) setFiltersOpen(false);
       else if(saveOpen) setSaveOpen(false);
       else if(savedOpen) setSavedOpen(false);
+      else if(questionOpen) setQuestionOpen(false);
+      else if(actionSuccess) setActionSuccess('');
     };
-    if(selected||filtersOpen||saveOpen||savedOpen){tg.BackButton.show(); tg.BackButton.onClick(goBack);}
+    if(selected||filtersOpen||saveOpen||savedOpen||questionOpen||actionSuccess){tg.BackButton.show(); tg.BackButton.onClick(goBack);}
     else tg.BackButton.hide();
     return ()=>{try{tg.BackButton.offClick(goBack);}catch{}};
-  },[selected,filtersOpen,saveOpen,savedOpen]);
+  },[selected,filtersOpen,saveOpen,savedOpen,questionOpen,actionSuccess]);
 
   useEffect(()=>{
     if(savedOpen&&initData) loadSaved();
@@ -230,21 +288,40 @@ function App(){
   const results=useMemo(()=>{
     if(!catalog) return [];
     const q=normalizedSearch(filters.query);
-    const queryTokens=q.split(/\s+/).filter(x=>x.length>=3&&!['квартира','квартиру','дом','ищу','нужна'].includes(x));
-    return catalog.items.filter(item=>{
+    const queryTokens=q.split(/\s+/).filter(x=>x.length>=2&&!['квартира','квартиру','дом','ищу','нужна'].includes(x));
+    const rows=catalog.items.filter(item=>{
+      const d=item.details||{};
       if(filters.operation&&item.operation!==filters.operation) return false;
       if(filters.neighborhoods.length&&!filters.neighborhoods.some(x=>item.neighborhoods.includes(x))) return false;
       if(filters.propertyTypes.length&&!filters.propertyTypes.includes(item.propertyType)) return false;
-      if(filters.rooms&&Number(item.details?.rooms||0)!==filters.rooms) return false;
-      if(filters.maxBudget){
+      if(filters.rooms&&Number(d.rooms||0)!==filters.rooms) return false;
+      if(filters.bedrooms&&Number(d.bedrooms||0)<filters.bedrooms) return false;
+      if(filters.bathrooms&&Number(d.bathrooms||0)<filters.bathrooms) return false;
+      if(filters.parking&&Number(d.parkingSpaces||0)<1) return false;
+      if(filters.minArea&&Number(d.totalAreaM2||d.coveredAreaM2||0)<Number(filters.minArea)) return false;
+      if(filters.maxArea&&Number(d.totalAreaM2||d.coveredAreaM2||0)>Number(filters.maxArea)) return false;
+      if(filters.minBudget||filters.maxBudget){
         if(item.priceCurrency!==filters.budgetCurrency) return false;
-        if(Number(item.priceAmount||0)>Number(filters.maxBudget)) return false;
+        const price=Number(item.priceAmount||0);
+        if(!price) return false;
+        if(filters.minBudget&&price<Number(filters.minBudget)) return false;
+        if(filters.maxBudget&&price>Number(filters.maxBudget)) return false;
       }
+      if(filters.features.length&&!filters.features.every(key=>itemHasFeature(item,key))) return false;
       if(queryTokens.length){
-        const hay=normalizedSearch([item.address,item.description,...item.highlightedFeatures,...item.neighborhoods].join(' '));
-        if(!queryTokens.some(token=>hay.includes(token))) return false;
+        const hay=normalizedSearch([
+          item.address,item.code,item.propertyType,item.description,
+          ...item.highlightedFeatures,...item.neighborhoods
+        ].join(' '));
+        if(!queryTokens.every(token=>hay.includes(token))) return false;
       }
       return true;
+    });
+    return rows.sort((a,b)=>{
+      if(filters.sort==='price_asc') return Number(a.priceAmount||0)-Number(b.priceAmount||0);
+      if(filters.sort==='price_desc') return Number(b.priceAmount||0)-Number(a.priceAmount||0);
+      if(filters.sort==='area_desc') return Number(b.details?.totalAreaM2||b.details?.coveredAreaM2||0)-Number(a.details?.totalAreaM2||a.details?.coveredAreaM2||0);
+      return 0;
     });
   },[catalog,filters]);
 
@@ -265,32 +342,78 @@ function App(){
       showToast(err.message||'Не удалось загрузить детали');
     }
   }
-  async function listingAction(action:string){
+  async function submitListingIntent(action:'availability'|'viewing'|'question',message=''){
     if(!selected) return;
     if(!initData){showToast('Откройте каталог внутри Telegram');return;}
     setBusy(true);
     try{
-      const res=await api<{telegram_url:string;share_url?:string;prepared_message_id?:string}>('/api/v1/actions',{
+      const res=await api<{message?:string}>('/api/v1/actions',{
         method:'POST',body:JSON.stringify({
-          init_data:initData,listing_code:listingKey(selected),action,link_token:trackingToken||undefined
+          init_data:initData,listing_code:listingKey(selected),action,message:message||undefined,
+          link_token:trackingToken||undefined
         })
       });
-      if(action==='share'&&res.prepared_message_id&&typeof tg?.shareMessage==='function'){
-        const listingAtShare=selected;
-        tg.shareMessage(res.prepared_message_id,(sent:boolean)=>{
-          if(sent){
-            haptic('success');
-            event('share_sent',listingAtShare,{via:'prepared_message'});
-          }
-        });
-        return;
-      }
       haptic('success');
-      const destination=action==='share'&&res.share_url?res.share_url:res.telegram_url;
-      if(tg?.openTelegramLink) tg.openTelegramLink(destination);
-      else window.location.href=destination;
-    }catch(err:any){showToast(err.message||'Не удалось открыть чат');}
+      setQuestionOpen(false);
+      setQuestionText('');
+      setActionSuccess(res.message||'Запрос отправлен');
+    }catch(err:any){showToast(err.message||'Не удалось отправить запрос');}
     finally{setBusy(false);}
+  }
+  async function listingAction(action:string){
+    if(!selected)return;
+    if(action==='question'){
+      setQuestionText('');
+      setQuestionOpen(true);
+      return;
+    }
+    if(action==='similar'){
+      const d=selected.details||{};
+      const price=Number(selected.priceAmount||0);
+      const next:Filters={
+        ...DEFAULT_FILTERS,
+        operation:selected.operation,
+        neighborhoods:selected.neighborhoods?.[0]?[selected.neighborhoods[0]]:[],
+        propertyTypes:selected.propertyType?[selected.propertyType]:[],
+        rooms:d.rooms||null,
+        minBudget:price?String(Math.round(price*.7)):'',
+        maxBudget:price?String(Math.round(price*1.3)):'',
+        budgetCurrency:selected.priceCurrency||'USD',
+      };
+      setFilters(next);
+      setSelected(null);
+      setViewMode('list');
+      searchStarted.current=true;
+      event('search_started',selected,{via:'similar'});
+      showToast('Показали похожие варианты');
+      return;
+    }
+    if(action==='share'){
+      if(!initData){showToast('Поделиться можно внутри Telegram');return;}
+      setBusy(true);
+      try{
+        const res=await api<{telegram_url:string;share_url?:string;prepared_message_id?:string}>('/api/v1/actions',{
+          method:'POST',body:JSON.stringify({
+            init_data:initData,listing_code:listingKey(selected),action,link_token:trackingToken||undefined
+          })
+        });
+        if(res.prepared_message_id&&typeof tg?.shareMessage==='function'){
+          const listingAtShare=selected;
+          tg.shareMessage(res.prepared_message_id,(sent:boolean)=>{
+            if(sent){haptic('success');event('share_sent',listingAtShare,{via:'prepared_message'});}
+          });
+        }else{
+          const destination=res.share_url||res.telegram_url;
+          if(tg?.openTelegramLink)tg.openTelegramLink(destination);
+          else window.location.href=destination;
+        }
+      }catch(err:any){showToast(err.message||'Не удалось поделиться');}
+      finally{setBusy(false);}
+      return;
+    }
+    if(action==='availability'||action==='viewing'){
+      await submitListingIntent(action);
+    }
   }
   async function saveSearch(){
     if(!initData){showToast('Сохранение доступно внутри Telegram');return;}
@@ -357,8 +480,14 @@ function App(){
   }
 
   if(selected){
-    return <ListingDetail item={selected} busy={busy} brandName={config.brandName} onBack={()=>setSelected(null)}
-      onAction={listingAction} onGallery={()=>event('gallery_opened',selected)} />;
+    return <>
+      <ListingDetail item={selected} busy={busy} brandName={config.brandName} onBack={()=>setSelected(null)}
+        onAction={listingAction} onGallery={()=>event('gallery_opened',selected)} />
+      {questionOpen&&<QuestionSheet value={questionText} onChange={setQuestionText} busy={busy}
+        onClose={()=>setQuestionOpen(false)} onSubmit={()=>submitListingIntent('question',questionText)}/>}
+      {actionSuccess&&<SuccessSheet message={actionSuccess} onClose={()=>setActionSuccess('')}/>}
+      {toast&&<div className="toast"><Check size={17}/>{toast}</div>}
+    </>;
   }
 
   return <div className="app">
@@ -399,21 +528,40 @@ function App(){
       </div>
 
       <div className="resultHeader">
-        <div><strong>{results.length}</strong><span> {plural(results.length,'объект','объекта','объектов')}</span></div>
-        {activeFilterCount(filters)>0&&<button className="textBtn" onClick={()=>{setFilters(DEFAULT_FILTERS);searchStarted.current=false}}>Сбросить</button>}
+        <div className="resultCount"><strong>{results.length}</strong><span> {plural(results.length,'объект','объекта','объектов')}</span></div>
+        <div className="resultActions">
+          <select className="sortSelect" value={filters.sort} onChange={e=>update({sort:e.target.value})} aria-label="Сортировка">
+            <option value="recommended">Сначала рекомендуемые</option>
+            <option value="price_asc">Цена: ниже</option>
+            <option value="price_desc">Цена: выше</option>
+            <option value="area_desc">Площадь: больше</option>
+          </select>
+          <div className="viewToggle" aria-label="Вид каталога">
+            <button className={viewMode==='list'?'active':''} onClick={()=>setViewMode('list')} aria-label="Список"><List size={16}/></button>
+            <button className={viewMode==='map'?'active':''} onClick={()=>setViewMode('map')} aria-label="Карта"><MapIcon size={16}/></button>
+          </div>
+        </div>
       </div>
+      {activeFilterCount(filters)>0&&<div className="activeSummary">
+        <span>{activeFilterCount(filters)} активных фильтра</span>
+        <button onClick={()=>{setFilters(DEFAULT_FILTERS);searchStarted.current=false}}>Сбросить всё</button>
+      </div>}
 
-      <section className="cards">
-        {results.map(item=><ListingCard key={item.code+item.sourceUrl} item={item} onOpen={()=>openListing(item)}/>)}
-        {!results.length&&<div className="emptyState">
-          <div className="emptyIcon"><Search size={26}/></div>
-          <h3>Точного совпадения нет</h3>
-          <p>{canSaveSearch(filters)
-            ?'Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.'
-            :'Добавьте район, тип объекта, комнаты, бюджет или поисковый запрос, чтобы сохранить поиск.'}</p>
-          {canSaveSearch(filters)&&<button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>}
-        </div>}
-      </section>
+      {viewMode==='map'&&results.length>0
+        ?<React.Suspense fallback={<div className="mapLoading"><div className="spinner"/><span>Загружаем карту…</span></div>}>
+          <CatalogMap items={results} onOpen={item=>openListing(item as Listing)}/>
+        </React.Suspense>
+        :<section className="cards">
+          {results.map(item=><ListingCard key={listingKey(item)} item={item} onOpen={()=>openListing(item)}/>)}
+          {!results.length&&<div className="emptyState">
+            <div className="emptyIcon"><Search size={26}/></div>
+            <h3>Точного совпадения нет</h3>
+            <p>{canSaveSearch(filters)
+              ?'Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.'
+              :'Добавьте район, тип объекта, комнаты, бюджет или поисковый запрос, чтобы сохранить поиск.'}</p>
+            {canSaveSearch(filters)&&<button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>}
+          </div>}
+        </section>}
     </main>
 
     {canSaveSearch(filters)&&results.length>0&&
@@ -479,7 +627,7 @@ function ListingDetail({item,busy,brandName,onBack,onAction,onGallery}:{item:Lis
       </div>}
       {item.description&&<section className="detailSection"><h2>Об объекте</h2><p>{item.description}</p></section>}
       {!!item.highlightedFeatures.length&&<section className="detailSection"><h2>Особенности</h2><div className="featureList">
-        {item.highlightedFeatures.map(x=><span key={x}>{x}</span>)}
+        {item.highlightedFeatures.map(x=><span key={x}>{translateFeature(x)}</span>)}
       </div></section>}
       {!!item.notes.length&&<section className="noteBox">{item.notes.map(x=><p key={x}>{x}</p>)}</section>}
       <div className="detailQuickActions">
@@ -497,10 +645,36 @@ function ListingDetail({item,busy,brandName,onBack,onAction,onGallery}:{item:Lis
   </div>;
 }
 
-function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate,onToggleHood,onToggleType}:any){
+function QuestionSheet({value,onChange,busy,onClose,onSubmit}:any){
   return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
-    <div className="sheet tall">
-      <div className="sheetHandle"/><div className="sheetHead"><div><span>Фильтры</span><strong>{count} объектов</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
+    <div className="sheet">
+      <div className="sheetHandle"/>
+      <div className="sheetHead"><div><span>Вопрос по объекту</span><strong>Ответим в Telegram</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
+      <p className="sheetText">Напишите, что хотите уточнить: документы, расходы, условия сделки, планировку или что-то ещё.</p>
+      <textarea className="questionInput" autoFocus rows={5} maxLength={2000} value={value} onChange={e=>onChange(e.target.value)} placeholder="Например: можно ли купить этот объект с иностранным доходом?"/>
+      <button className="primary full" disabled={busy||!value.trim()} onClick={onSubmit}>{busy?'Отправляем…':'Отправить вопрос'}</button>
+    </div>
+  </div>;
+}
+
+function SuccessSheet({message,onClose}:{message:string;onClose:()=>void}){
+  return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
+    <div className="sheet successSheet">
+      <div className="successIcon"><Check size={26}/></div>
+      <h3>{message}</h3>
+      <p>Запрос сохранён. Ответ придёт в этот же Telegram.</p>
+      <button className="primary full" onClick={onClose}>Готово</button>
+    </div>
+  </div>;
+}
+
+function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate,onToggleHood,onToggleType}:any){
+  const toggleFeature=(key:string)=>onUpdate({features:filters.features.includes(key)
+    ?filters.features.filter((x:string)=>x!==key):[...filters.features,key]});
+  return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
+    <div className="sheet filterSheet">
+      <div className="sheetHandle"/>
+      <div className="sheetHead"><div><span>Фильтры</span><strong>{count} объектов сейчас</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
       <div className="sheetScroll">
         <section className="filterSection"><h3>Район / город</h3><div className="chipsWrap">
           {neighborhoods.map((x:string)=><button key={x} className={filters.neighborhoods.includes(x)?'chip active':'chip'} onClick={()=>onToggleHood(x)}>{prettyHood(x)}</button>)}
@@ -508,12 +682,29 @@ function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate
         <section className="filterSection"><h3>Тип объекта</h3><div className="chipsWrap">
           {propertyTypes.map((x:string)=><button key={x} className={filters.propertyTypes.includes(x)?'chip active':'chip'} onClick={()=>onToggleType(x)}>{translateType(x)}</button>)}
         </div></section>
+        <section className="filterSection"><h3>Цена</h3>
+          <div className="currencyTabs">
+            {['USD','ARS'].map((cur:string)=><button key={cur} className={filters.budgetCurrency===cur?'active':''} onClick={()=>onUpdate({budgetCurrency:cur})}>{cur}</button>)}
+          </div>
+          <div className="rangeInputs">
+            <input inputMode="numeric" value={filters.minBudget} onChange={e=>onUpdate({minBudget:e.target.value.replace(/\D/g,'')})} placeholder="От"/>
+            <input inputMode="numeric" value={filters.maxBudget} onChange={e=>onUpdate({maxBudget:e.target.value.replace(/\D/g,'')})} placeholder="До"/>
+          </div>
+        </section>
         <section className="filterSection"><h3>Комнаты</h3><div className="roomsRow">
           {[1,2,3,4,5].map(n=><button key={n} className={filters.rooms===n?'room active':'room'} onClick={()=>onUpdate({rooms:filters.rooms===n?null:n})}>{n}</button>)}
         </div></section>
-        <section className="filterSection"><h3>Бюджет до</h3><div className="budgetRow">
-          <select value={filters.budgetCurrency} onChange={e=>onUpdate({budgetCurrency:e.target.value})}><option>USD</option><option>ARS</option></select>
-          <input inputMode="numeric" value={filters.maxBudget} onChange={e=>onUpdate({maxBudget:e.target.value.replace(/\D/g,'')})} placeholder="Например, 150000"/>
+        <section className="filterSection splitFilter">
+          <div><h3>Спален от</h3><div className="miniChoice">{[1,2,3,4].map(n=><button key={n} className={filters.bedrooms===n?'active':''} onClick={()=>onUpdate({bedrooms:filters.bedrooms===n?null:n})}>{n}+</button>)}</div></div>
+          <div><h3>Ванных от</h3><div className="miniChoice">{[1,2,3].map(n=><button key={n} className={filters.bathrooms===n?'active':''} onClick={()=>onUpdate({bathrooms:filters.bathrooms===n?null:n})}>{n}+</button>)}</div></div>
+        </section>
+        <section className="filterSection"><h3>Площадь, м²</h3><div className="rangeInputs">
+          <input inputMode="numeric" value={filters.minArea} onChange={e=>onUpdate({minArea:e.target.value.replace(/\D/g,'')})} placeholder="От"/>
+          <input inputMode="numeric" value={filters.maxArea} onChange={e=>onUpdate({maxArea:e.target.value.replace(/\D/g,'')})} placeholder="До"/>
+        </div></section>
+        <section className="filterSection"><h3>Удобства</h3><div className="chipsWrap">
+          <button className={filters.parking?'chip active':'chip'} onClick={()=>onUpdate({parking:!filters.parking})}>Парковка</button>
+          {FEATURE_OPTIONS.filter(x=>x.key!=='cochera').map(x=><button key={x.key} className={filters.features.includes(x.key)?'chip active':'chip'} onClick={()=>toggleFeature(x.key)}>{x.label}</button>)}
         </div></section>
       </div>
       <div className="sheetFooter"><button className="primary" onClick={onClose}>Показать {count} {plural(count,'объект','объекта','объектов')}</button></div>
@@ -564,6 +755,19 @@ function translateType(x:string){
     'Terreno o Lote':'Участок',Terreno:'Участок',
     Oficina:'Офис','Depósito':'Склад',Propiedad:'Недвижимость'
   } as any)[x]||x;
+}
+function translateFeature(x:string){
+  const key=normalizedSearch(x);
+  const known:Record<string,string>={
+    'balcon':'Балкон','aire acondicionado':'Кондиционер','calefaccion':'Отопление',
+    'parrilla':'Зона барбекю','piscina':'Бассейн','pileta':'Бассейн','sum':'Общий зал',
+    'laundry':'Прачечная','lavadero':'Прачечная','solarium':'Солярий','gimnasio':'Спортзал',
+    'gym':'Спортзал','jardin':'Сад','patio':'Патио','terraza':'Терраса','baulera':'Кладовая',
+    'quincho':'Крытая зона барбекю','apto credito':'Подходит под ипотеку',
+    'apto profesional':'Для профессионального использования','amoblado':'Меблирована',
+    'ascensor':'Лифт','a estrenar':'Новостройка','luminoso':'Светлая','seguridad 24':'Охрана 24/7'
+  };
+  return known[key]||x;
 }
 function plural(n:number,one:string,few:string,many:string){const x=Math.abs(n)%100,y=x%10;if(x>10&&x<20)return many;if(y>1&&y<5)return few;if(y===1)return one;return many}
 
