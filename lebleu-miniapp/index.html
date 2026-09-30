@@ -5,11 +5,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#ffffff" />
   <meta name="description" content="Каталог недвижимости Le Bleu" />
-  <title>Le Bleu · Недвижимость</title>
+  <title>Le Bleu · Каталог</title>
+  <style>
+    html,body,#root{margin:0;min-height:100%;background:#fff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .boot{min-height:100vh;display:grid;place-items:center;padding:28px;box-sizing:border-box;text-align:center;color:#15202b}
+    .boot strong{display:block;font-size:20px;margin-bottom:8px}
+    .boot span{display:block;color:#6b7280;font-size:14px;line-height:1.45}
+    .boot button{margin-top:18px;border:0;border-radius:14px;padding:12px 18px;background:#0f6b4f;color:#fff;font-weight:700;font-size:15px}
+  </style>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root"><div class="boot"><div><strong>Le Bleu</strong><span>Открываем каталог…</span></div></div></div>
+  <script>
+    try {
+      if (window.Telegram && window.Telegram.WebApp) {
+        window.Telegram.WebApp.ready();
+        window.Telegram.WebApp.expand();
+      }
+    } catch (_) {}
+    window.__lebleuBootTimer = window.setTimeout(function () {
+      var root = document.getElementById('root');
+      if (!root || !root.querySelector('.boot')) return;
+      root.innerHTML = '<div class="boot"><div><strong>Не удалось открыть каталог</strong><span>Проверьте соединение и попробуйте ещё раз.</span><button onclick="location.reload()">Повторить</button></div></div>';
+    }, 12000);
+  </script>
   <script type="module" src="/src/main.tsx"></script>
 </body>
 </html>
