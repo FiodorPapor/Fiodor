@@ -50,6 +50,26 @@ def http_ok(url: str, timeout: float = 4.0) -> bool:
         return False
 
 
+def miniapp_boot_ok(url: str, timeout: float = 4.0) -> tuple[bool, str]:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "LeBleuProductWatch/1.0", "Cache-Control": "no-cache"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(8192).decode("utf-8", errors="replace")
+            cache_control = ",".join(r.headers.get_all("Cache-Control") or []).lower()
+            if not (200 <= r.status < 300):
+                return False, f"http {r.status}"
+            if "Открываем каталог" not in body or "Повторить" not in body:
+                return False, "boot fallback marker missing"
+            if "no-store" not in cache_control:
+                return False, f"html cache policy unsafe: {cache_control or 'missing'}"
+            return True, "ok"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def send_telegram(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         return False
@@ -183,11 +203,16 @@ def main() -> int:
         "Property Intent": "http://127.0.0.1:8050/health",
         "Growth Core": "http://127.0.0.1:8040/health",
         "CRM": "http://127.0.0.1:8020/health",
-        "Mini App": "https://lebleu-app.srv1636153.hstgr.cloud/",
     }
     for name, url in endpoints.items():
         if not http_ok(url):
             issues.append(f"{name} недоступен")
+
+    miniapp_ok, miniapp_detail = miniapp_boot_ok(
+        "https://lebleu-app.srv1636153.hstgr.cloud/?health=1"
+    )
+    if not miniapp_ok:
+        issues.append(f"Mini App boot unhealthy: {miniapp_detail}")
 
     current_status = "unhealthy" if issues else "healthy"
     previous_status = previous.get("status")
