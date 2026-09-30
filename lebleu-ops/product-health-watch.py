@@ -14,6 +14,10 @@ CATALOG = ROOT / "public/data/full/catalog.json"
 PUBLISHER_STATE = ROOT / "state/telegram-state.json"
 GEO_ENRICHMENT = ROOT / "state/geo-enrichment.json"
 SOURCE_FAILURES = ROOT / "public/data/full/failures.json"
+CATALOG_QUALITY = ROOT / "state/catalog-quality.json"
+CATALOG_ALIASES = ROOT / "public/data/full/catalog-aliases.json"
+CHANNEL_INTEGRITY = ROOT / "state/channel-integrity.json"
+USER_DELETE_QUEUE = ROOT / "state/telegram-user-delete-queue.json"
 STATE = ROOT / "state/product-health.json"
 ENV = Path("/opt/property-intent-core/.env")
 STALE_SECONDS = 3 * 60 * 60
@@ -112,6 +116,41 @@ def main() -> int:
         if catalog_count <= 0:
             issues.append("каталог пуст")
 
+    quality = load_json(CATALOG_QUALITY, {})
+    quality_output_count = int(quality.get("outputCount") or 0) if isinstance(quality, dict) else 0
+    quality_input_count = int(quality.get("inputCount") or 0) if isinstance(quality, dict) else 0
+    quality_suppressed_count = int(quality.get("suppressedCount") or 0) if isinstance(quality, dict) else 0
+    quality_photo_drops = int(quality.get("duplicatePhotosRemoved") or 0) if isinstance(quality, dict) else 0
+    quality_image_errors = int(quality.get("imageErrors") or 0) if isinstance(quality, dict) else 0
+    quality_version = str(quality.get("version") or "") if isinstance(quality, dict) else ""
+    if not quality_version.startswith("dedupe-v3-cross-type-image-verified"):
+        issues.append("catalog quality normalizer не v3 cross-type image-verified")
+    if catalog_count and quality_output_count != catalog_count:
+        issues.append(f"quality report не совпадает с каталогом: {quality_output_count}/{catalog_count}")
+    if quality_image_errors > max(3, int(max(quality_input_count, 1) * 0.03)):
+        issues.append(f"ошибки image dedupe: {quality_image_errors}")
+    if CATALOG_QUALITY.exists() and CATALOG.exists():
+        if CATALOG_QUALITY.stat().st_mtime + 5 < CATALOG.stat().st_mtime:
+            issues.append("quality report старее catalog.json")
+
+    alias_payload = load_json(CATALOG_ALIASES, {})
+    aliases = alias_payload.get("aliases", {}) if isinstance(alias_payload, dict) else {}
+    alias_count = len(aliases) if isinstance(aliases, dict) else 0
+    if alias_count != quality_suppressed_count:
+        issues.append(f"alias map не совпадает с dedupe: {alias_count}/{quality_suppressed_count}")
+
+    channel_integrity = load_json(CHANNEL_INTEGRITY, {})
+    if isinstance(channel_integrity, dict) and channel_integrity:
+        if not channel_integrity.get("healthy", False):
+            issues.append("последний channel integrity audit unhealthy")
+
+    pending_user_deletes = load_json(USER_DELETE_QUEUE, [])
+    pending_user_delete_count = (
+        len(pending_user_deletes) if isinstance(pending_user_deletes, list) else 0
+    )
+    if pending_user_delete_count:
+        issues.append(f"Telegram cleanup queue не пуст: {pending_user_delete_count}")
+
     last_good_count = int(previous.get("last_good_catalog_count") or 0)
     if last_good_count and catalog_count < max(20, int(last_good_count * 0.7)):
         issues.append(f"резкое падение inventory: {last_good_count} → {catalog_count}")
@@ -175,6 +214,17 @@ def main() -> int:
         "publisher_count": published_count,
         "geo_count": geo_count,
         "source_failure_count": source_failure_count,
+        "quality_version": quality_version,
+        "quality_input_count": quality_input_count,
+        "quality_output_count": quality_output_count,
+        "quality_suppressed_count": quality_suppressed_count,
+        "quality_duplicate_photos_removed": quality_photo_drops,
+        "quality_image_errors": quality_image_errors,
+        "alias_count": alias_count,
+        "pending_user_delete_count": pending_user_delete_count,
+        "channel_integrity_healthy": (
+            channel_integrity.get("healthy") if isinstance(channel_integrity, dict) and channel_integrity else None
+        ),
         "last_good_catalog_count": (
             last_good_count
             if any(x.startswith("резкое падение inventory") for x in issues)
