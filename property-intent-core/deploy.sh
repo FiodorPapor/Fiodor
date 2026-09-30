@@ -35,7 +35,7 @@ for raw in Path(".env").read_text().splitlines():
     key,value=line.split("=",1)
     env[key]=value.strip().strip('"').strip("'")
 token=env.get("TELEGRAM_BOT_TOKEN","")
-url=env.get("MINIAPP_URL","")
+url=env.get("MENU_BUTTON_URL") or env.get("MINIAPP_URL","")
 menu_text=env.get("MENU_BUTTON_TEXT","Каталог")
 if token and url:
     payload=json.dumps({
