@@ -30,8 +30,11 @@ const requestedListing = launchParams.get('listing') || '';
 const requestedSavedSearch = launchParams.get('saved') || '';
 
 function api<T>(path:string, options?:RequestInit):Promise<T>{
+  const controller=new AbortController();
+  const timer=window.setTimeout(()=>controller.abort(),10000);
   return fetch(path,{
     ...options,
+    signal:controller.signal,
     headers:{'content-type':'application/json',...(options?.headers||{})}
   }).then(async r=>{
     if(!r.ok){
@@ -40,7 +43,10 @@ function api<T>(path:string, options?:RequestInit):Promise<T>{
       throw new Error(message);
     }
     return r.json();
-  });
+  }).catch(err=>{
+    if(err?.name==='AbortError') throw new Error('Сервер не ответил. Попробуйте ещё раз.');
+    throw err;
+  }).finally(()=>window.clearTimeout(timer));
 }
 
 function fmtPrice(item:Listing){
@@ -115,6 +121,7 @@ function brandInitials(name:string){
 function App(){
   const [config,setConfig]=useState<PublicConfig>(DEFAULT_CONFIG);
   const [catalog,setCatalog]=useState<Catalog|null>(null);
+  const [loadError,setLoadError]=useState('');
   const [filters,setFilters]=useState<Filters>(DEFAULT_FILTERS);
   const [selected,setSelected]=useState<Listing|null>(null);
   const [filtersOpen,setFiltersOpen]=useState(false);
@@ -142,15 +149,25 @@ function App(){
       document.querySelector('meta[name="description"]')?.setAttribute('content','Каталог недвижимости · '+data.brandName);
     }).catch(()=>{});
     api<Catalog>('/api/v1/catalog').then(data=>{
+      setLoadError('');
       setCatalog(data);
       if(initData) event('catalog_opened');
       if(requestedListing){
         const item=data.items.find(x=>listingKey(x)===requestedListing||x.code===requestedListing);
         if(item) openListing(item);
+        else{
+          api<Listing>(`/api/v1/catalog/${encodeURIComponent(requestedListing)}`)
+            .then(full=>{setSelected(full);event('listing_opened',full);})
+            .catch(()=>showToast('Этот объект больше не доступен'));
+        }
       }else if(requestedSavedSearch&&initData){
         restoreSavedSearch(requestedSavedSearch);
       }
-    }).catch(err=>showToast(err.message));
+    }).catch(err=>{
+      const message=err?.message||'Не удалось загрузить каталог';
+      setLoadError(message);
+      showToast(message);
+    });
   },[]);
 
   useEffect(()=>{
@@ -324,6 +341,15 @@ function App(){
       await api(`/api/v1/saved-searches/${id}?init_data=${encodeURIComponent(initData)}`,{method:'DELETE'});
       setSaved(x=>x.filter(s=>s.id!==id)); haptic('success');
     }catch(err:any){showToast(err.message||'Не удалось удалить');}
+  }
+
+  if(!catalog&&loadError){
+    return <div className="loading loadError">
+      <div className="emptyIcon"><X size={26}/></div>
+      <strong>Не удалось открыть каталог</strong>
+      <span>{loadError}</span>
+      <button className="primary" onClick={()=>window.location.reload()}>Повторить</button>
+    </div>;
   }
 
   if(!catalog){
