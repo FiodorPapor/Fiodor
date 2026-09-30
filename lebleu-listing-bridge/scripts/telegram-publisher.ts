@@ -13,6 +13,7 @@ const STATE_FILE = `${ROOT}/state/telegram-state.json`;
 const TOPICS_FILE = `${ROOT}/state/forum-topics.json`;
 const CONFIG_FILE = `${ROOT}/publisher.env`;
 const QUALITY_CONTENT_FILE = `${ROOT}/state/ru-content-quality.json`;
+const USER_DELETE_QUEUE = `${ROOT}/state/telegram-user-delete-queue.json`;
 const CRM_ENV = "/opt/fiodor-crm-v2/.env";
 const GROWTH_ENV = "/opt/growth-core/.env";
 
@@ -440,6 +441,18 @@ async function editCaption(token: string, channel: string, entry: Entry, caption
     });
   }
 }
+async function queueUserDeletion(ids: number[]) {
+  let queued: number[] = [];
+  try {
+    const raw = JSON.parse(await fs.readFile(USER_DELETE_QUEUE, "utf8"));
+    if (Array.isArray(raw)) queued = raw.map(Number).filter(Number.isFinite);
+  } catch {}
+  const merged = [...new Set([...queued, ...ids])].sort((a, b) => a - b);
+  const tmp = `${USER_DELETE_QUEUE}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(merged, null, 2));
+  await fs.rename(tmp, USER_DELETE_QUEUE);
+}
+
 async function deleteEntryMessages(token: string, channel: string, entry: Entry) {
   const ids = [...(entry.messageIds || []), ...(entry.ctaMessageId ? [entry.ctaMessageId] : [])];
   for (const messageId of ids) {
@@ -447,7 +460,11 @@ async function deleteEntryMessages(token: string, channel: string, entry: Entry)
       await api(token, "deleteMessage", { chat_id: channel, message_id: messageId });
     } catch (error) {
       const text = String(error);
-      if (!/message to delete not found|message identifier is not specified/i.test(text)) throw error;
+      if (/message can't be deleted/i.test(text)) {
+        await queueUserDeletion([messageId]);
+      } else if (!/message to delete not found|message identifier is not specified/i.test(text)) {
+        throw error;
+      }
     }
     await new Promise(resolve => setTimeout(resolve, 120));
   }
@@ -525,6 +542,21 @@ async function main() {
     throw new Error(`State belongs to ${previous.channel}, configured channel is ${channel}`);
   }
   const state: State = { channel, entries: previous.entries || {} };
+  const activePreviousCount = Object.values(state.entries).filter(
+    entry => entry?.status === "active" && ((entry.messageIds || []).length > 0 || Boolean(entry.ctaMessageId)),
+  ).length;
+  if (apply && items.length >= 20 && !bootstrapOldestFirst) {
+    if (activePreviousCount === 0) {
+      throw new Error(
+        "Publisher state has no active entries. Refusing bulk NEW on a live catalog; use explicit bootstrap recovery.",
+      );
+    }
+    if (activePreviousCount < Math.floor(items.length * 0.5)) {
+      throw new Error(
+        `Publisher state unexpectedly small (${activePreviousCount}/${items.length}). Refusing apply to prevent duplicate generations.`,
+      );
+    }
+  }
   const current = new Map(items.map(x => [x.sourceUrl, x]));
   let created = 0, changed = 0, photosChanged = 0, removed = 0, unchanged = 0, blocked = 0, errors = 0;
   const actions: string[] = [];
