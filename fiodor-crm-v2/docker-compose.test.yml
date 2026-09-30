@@ -1,0 +1,29 @@
+# Dedicated disposable PostgreSQL service for focused local tests only.
+# It has no dependency on .env, no production/legacy network, and its volume is
+# removed with: docker compose -f docker-compose.test.yml down -v
+name: fiodor-crm-v2-test
+
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: fiodor-crm-v2-recorder-e2e-test-postgres
+    environment:
+      POSTGRES_USER: crm_test
+      POSTGRES_PASSWORD: crm_test
+      POSTGRES_DB: fiodor_crm_v2_test
+    ports:
+      # Keep the disposable CRM test database away from the production and
+      # other project PostgreSQL listeners on 5433-5439.
+      - "127.0.0.1:55440:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm_test -d fiodor_crm_v2_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [crm_v2_test]
+
+networks:
+  crm_v2_test:
+    name: fiodor-crm-v2-test
