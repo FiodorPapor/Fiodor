@@ -365,30 +365,58 @@ def _load_json(path: str, fallback: Any):
 
 def _structured_ru_fallback(src: dict[str, Any], details: dict[str, Any], property_type: str | None) -> str:
     title = PROPERTY_TYPE_RU.get(str(property_type or ""), "Объект недвижимости")
+    operation = str(src.get("operation") or "")
     address = str(src.get("address") or "").strip()
-    parts = [f"{title}{f' по адресу {address}' if address else ''}."]
+    if operation == "Venta":
+        opening = f"{title} на продажу"
+    elif operation == "Alquiler":
+        opening = f"{title} в аренду"
+    else:
+        opening = title
+    if address:
+        opening += f" по адресу {address}"
+    parts = [opening + "."]
+
+    def ru_count(value: Any, one: str, few: str, many: str) -> str:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return ""
+        n10, n100 = n % 10, n % 100
+        word = many if 11 <= n100 <= 14 else one if n10 == 1 else few if 2 <= n10 <= 4 else many
+        return f"{n} {word}"
+
     area = details.get("totalAreaM2") or details.get("coveredAreaM2")
     facts: list[str] = []
     if area:
-        facts.append(f"площадь {area:g} м²" if isinstance(area, (int, float)) else f"площадь {area} м²")
+        rendered = f"{area:g}" if isinstance(area, (int, float)) else str(area)
+        facts.append(f"площадь {rendered} м²")
     if details.get("rooms"):
-        facts.append(f"{details['rooms']} комн.")
+        facts.append(ru_count(details["rooms"], "комната", "комнаты", "комнат"))
     if details.get("bedrooms"):
-        facts.append(f"{details['bedrooms']} спальн.")
+        facts.append(ru_count(details["bedrooms"], "спальня", "спальни", "спален"))
     if details.get("bathrooms"):
-        facts.append(f"{details['bathrooms']} ванн.")
+        facts.append(ru_count(details["bathrooms"], "ванная", "ванные", "ванных"))
     if details.get("parkingSpaces"):
-        facts.append(f"парковочных мест: {details['parkingSpaces']}")
+        facts.append(ru_count(details["parkingSpaces"], "парковочное место", "парковочных места", "парковочных мест"))
+    facts = [x for x in facts if x]
     if facts:
-        parts.append("Основные параметры: " + ", ".join(facts) + ".")
+        if len(facts) == 1:
+            parts.append(f"Основной параметр: {facts[0]}.")
+        else:
+            parts.append("Параметры: " + ", ".join(facts[:-1]) + " и " + facts[-1] + ".")
+
     feature_names: list[str] = []
     for raw in src.get("highlightedFeatures") or []:
         translated = FEATURE_RU.get(str(raw).strip().lower())
         if translated and translated not in feature_names:
             feature_names.append(translated)
     if feature_names:
-        parts.append("Особенности: " + ", ".join(feature_names[:8]) + ".")
-    parts.append("Описание сформировано по структурированным данным исходного объявления Le Bleu.")
+        selected = feature_names[:6]
+        if len(selected) == 1:
+            parts.append(f"Есть {selected[0].lower()}.")
+        else:
+            parts.append("Есть " + ", ".join(x.lower() for x in selected[:-1]) + " и " + selected[-1].lower() + ".")
     return " ".join(parts)
 
 
