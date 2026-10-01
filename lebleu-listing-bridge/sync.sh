@@ -45,9 +45,12 @@ npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @Le
 echo "[$(date -Is)] catalog quality normalization"
 timeout 180s node scripts/normalize-catalog-quality.mjs
 
-echo "[$(date -Is)] Russian content refresh"
+echo "[$(date -Is)] Russian content candidate refresh"
+# Machine translation is staging only. It must never overwrite user-facing
+# reviewed Russian copy automatically; new/changed listings use the clean
+# structured Russian fallback until the candidate is reviewed.
 if ! timeout 150s "$ROOT/.venv-marian/bin/python" scripts/refresh-ru-content.py; then
-  echo "[$(date -Is)] WARN Russian content refresh failed; using last reviewed copy / structured fallback"
+  echo "[$(date -Is)] WARN Russian content candidate refresh failed; using reviewed copy / structured fallback"
 fi
 
 # Official Argentina Georef reverse-geocoding is enrichment only. Keep the last
