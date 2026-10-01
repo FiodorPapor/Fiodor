@@ -138,6 +138,10 @@ const FEATURE_OPTIONS=[
   {key:'apto_profesional',label:'Для проф. использования',terms:['apto profesional']},
   {key:'baulera',label:'Кладовая',terms:['baulera']},
   {key:'sum',label:'SUM',terms:['sum']},
+  {key:'ascensor',label:'Лифт',terms:['ascensor']},
+  {key:'patio',label:'Патио',terms:['patio']},
+  {key:'seguridad',label:'Охрана 24/7',terms:['seguridad 24','seguridad las 24']},
+  {key:'a_estrenar',label:'Новый / без проживания',terms:['a estrenar']},
 ];
 function itemHasFeature(item:Listing,key:string){
   const option=FEATURE_OPTIONS.find(x=>x.key===key);
@@ -288,7 +292,7 @@ function App(){
   const results=useMemo(()=>{
     if(!catalog) return [];
     const q=normalizedSearch(filters.query);
-    const queryTokens=q.split(/\s+/).filter(x=>x.length>=2&&!['квартира','квартиру','дом','ищу','нужна'].includes(x));
+    const queryTokens=q.split(/\s+/).filter(x=>x.length>=2&&!['ищу','нужна','нужен','хочу','вариант'].includes(x));
     const rows=catalog.items.filter(item=>{
       const d=item.details||{};
       if(filters.operation&&item.operation!==filters.operation) return false;
@@ -309,9 +313,10 @@ function App(){
       }
       if(filters.features.length&&!filters.features.every(key=>itemHasFeature(item,key))) return false;
       if(queryTokens.length){
+        const operationWords=item.operation==='Venta'?'продажа купить покупка':'аренда снять арендовать';
         const hay=normalizedSearch([
-          item.address,item.code,item.propertyType,item.description,
-          ...item.highlightedFeatures,...item.neighborhoods
+          item.address,item.code,item.propertyType,translateType(item.propertyType),operationWords,item.description,
+          ...item.highlightedFeatures,...item.highlightedFeatures.map(translateFeature),...item.neighborhoods
         ].join(' '));
         if(!queryTokens.every(token=>hay.includes(token))) return false;
       }
@@ -493,7 +498,7 @@ function App(){
   return <div className="app">
     <header className="topbar">
       <div className="brand">
-        <div className="brandMark">{brandInitials(config.brandName)}</div>
+        <img className="brandLogo" src="/brand-logo.jpg" alt="" />
         <div><strong>{config.brandName}</strong><span>{config.brandTagline||'Недвижимость'}</span></div>
       </div>
       {initData&&<button className="iconBtn" onClick={()=>setSavedOpen(true)} aria-label="Мои поиски"><Bookmark size={20}/></button>}
@@ -625,7 +630,7 @@ function ListingDetail({item,busy,brandName,onBack,onAction,onGallery}:{item:Lis
           'Ванные':item.details.bathrooms||null,
         }).filter(([,v])=>v).map(([k,v])=><div key={k}><span>{k}</span><strong>{v}</strong></div>)}
       </div>}
-      {item.description&&<section className="detailSection"><h2>Об объекте</h2><p>{item.description}</p></section>}
+      {item.description&&<section className="detailSection"><h2>Описание на русском</h2><p>{item.description}</p></section>}
       {!!item.highlightedFeatures.length&&<section className="detailSection"><h2>Особенности</h2><div className="featureList">
         {item.highlightedFeatures.map(x=><span key={x}>{translateFeature(x)}</span>)}
       </div></section>}
@@ -669,16 +674,28 @@ function SuccessSheet({message,onClose}:{message:string;onClose:()=>void}){
 }
 
 function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate,onToggleHood,onToggleType}:any){
+  const [hoodQuery,setHoodQuery]=useState('');
   const toggleFeature=(key:string)=>onUpdate({features:filters.features.includes(key)
     ?filters.features.filter((x:string)=>x!==key):[...filters.features,key]});
+  const visibleNeighborhoods=neighborhoods.filter((x:string)=>
+    !hoodQuery.trim()||normalizedSearch(prettyHood(x)).includes(normalizedSearch(hoodQuery))
+  );
   return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
     <div className="sheet filterSheet">
       <div className="sheetHandle"/>
       <div className="sheetHead"><div><span>Фильтры</span><strong>{count} объектов сейчас</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
       <div className="sheetScroll">
-        <section className="filterSection"><h3>Район / город</h3><div className="chipsWrap">
-          {neighborhoods.map((x:string)=><button key={x} className={filters.neighborhoods.includes(x)?'chip active':'chip'} onClick={()=>onToggleHood(x)}>{prettyHood(x)}</button>)}
-        </div></section>
+        <section className="filterSection">
+          <h3>Район / город <small className="filterHint">можно выбрать несколько</small></h3>
+          <div className="filterSearch">
+            <Search size={16}/>
+            <input value={hoodQuery} onChange={e=>setHoodQuery(e.target.value)} placeholder="Найти район"/>
+            {hoodQuery&&<button onClick={()=>setHoodQuery('')} aria-label="Очистить"><X size={15}/></button>}
+          </div>
+          <div className="chipsWrap">
+            {visibleNeighborhoods.map((x:string)=><button key={x} className={filters.neighborhoods.includes(x)?'chip active':'chip'} onClick={()=>onToggleHood(x)}>{prettyHood(x)}</button>)}
+          </div>
+        </section>
         <section className="filterSection"><h3>Тип объекта</h3><div className="chipsWrap">
           {propertyTypes.map((x:string)=><button key={x} className={filters.propertyTypes.includes(x)?'chip active':'chip'} onClick={()=>onToggleType(x)}>{translateType(x)}</button>)}
         </div></section>
