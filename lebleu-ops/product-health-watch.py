@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -104,6 +105,23 @@ def main() -> int:
     previous = load_json(STATE, {})
     issues: list[str] = []
 
+    stale_repls: list[str] = []
+    rc, ps_output = cmd("ps", "-eo", "pid=,etimes=,args=")
+    if rc == 0:
+        for raw in ps_output.splitlines():
+            parts = raw.strip().split(None, 2)
+            if len(parts) != 3:
+                continue
+            pid, age_raw, args = parts
+            try:
+                age_seconds = int(age_raw)
+            except ValueError:
+                continue
+            if age_seconds >= 300 and re.search(r"(?:^|\s)python(?:3(?:\.\d+)?)?\s+-i(?:\s|$)", args):
+                stale_repls.append(f"{pid}:{age_seconds}s")
+    if stale_repls:
+        issues.append("зависший interactive Python REPL: " + ", ".join(stale_repls[:3]))
+
     rc, active = cmd("systemctl", "is-active", "lebleu-listing-sync.timer")
     if rc != 0 or active != "active":
         issues.append("sync timer не active")
@@ -159,6 +177,7 @@ def main() -> int:
     ru_missing = 0
     ru_stale = 0
     ru_non_russian = 0
+    ru_unreviewed = 0
     if isinstance(catalog, list) and isinstance(ru_quality, dict):
         for item in catalog:
             row = ru_quality.get(item.get("sourceUrl")) or {}
@@ -170,11 +189,15 @@ def main() -> int:
                 ru_stale += 1
             if not any("А" <= ch <= "я" or ch in "Ёё" for ch in summary):
                 ru_non_russian += 1
+            editor = str(row.get("editor") or "")
+            if editor and ("auto" in editor.lower() or editor.lower().startswith("local_")):
+                ru_unreviewed += 1
     else:
         ru_missing = catalog_count
-    if ru_missing or ru_stale or ru_non_russian:
+    if ru_missing or ru_stale or ru_non_russian or ru_unreviewed:
         issues.append(
-            f"русский контент неполный: missing={ru_missing}, stale={ru_stale}, non_ru={ru_non_russian}"
+            "русский контент требует внимания: "
+            f"missing={ru_missing}, stale={ru_stale}, non_ru={ru_non_russian}, unreviewed={ru_unreviewed}"
         )
 
     alias_payload = load_json(CATALOG_ALIASES, {})
@@ -272,8 +295,10 @@ def main() -> int:
         "ru_content_missing": ru_missing,
         "ru_content_stale": ru_stale,
         "ru_content_non_russian": ru_non_russian,
+        "ru_content_unreviewed": ru_unreviewed,
         "alias_count": alias_count,
         "pending_user_delete_count": pending_user_delete_count,
+        "stale_interactive_repl_count": len(stale_repls),
         "channel_integrity_healthy": (
             channel_integrity.get("healthy") if isinstance(channel_integrity, dict) and channel_integrity else None
         ),
