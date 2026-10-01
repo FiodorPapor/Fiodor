@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path("/opt/lebleu-listing-bridge")
 CATALOG = ROOT / "public/data/full/catalog.json"
 QUALITY = ROOT / "state/ru-content-quality.json"
+CANDIDATES = ROOT / "state/ru-content-candidates.json"
 MODEL = "Helsinki-NLP/opus-mt-es-ru"
 
 CRITICAL = re.compile(
@@ -97,6 +98,7 @@ def main() -> None:
 
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
     quality = json.loads(QUALITY.read_text(encoding="utf-8")) if QUALITY.exists() else {}
+    candidates = json.loads(CANDIDATES.read_text(encoding="utf-8")) if CANDIDATES.exists() else {}
 
     work: list[tuple[dict, list[str], list[str]]] = []
     for item in catalog:
@@ -134,26 +136,27 @@ def main() -> None:
         summary = " ".join(x for x in summary_rows if x).strip()
         if not summary:
             continue
-        quality[source_url] = {
+        candidates[source_url] = {
             "code": item.get("code"),
             "operation": item.get("operation"),
             "sourceFingerprint": item.get("sourceFingerprint"),
-            "summary_ru": summary[:1100],
-            "notes_ru": [x for x in note_rows if x][:4],
-            "details_override": {},
-            "property_type_override": None,
-            "reviewed": date.today().isoformat(),
-            "editor": "local_marian_auto_v1",
+            "candidate_summary_ru": summary[:1100],
+            "candidate_notes_ru": [x for x in note_rows if x][:4],
+            "generated": date.today().isoformat(),
+            "translator": "local_marian_candidate_v2",
+            "status": "needs_review",
         }
         translated += 1
 
-    backup = QUALITY.with_name("ru-content-quality.before-auto.json")
-    if QUALITY.exists():
-        backup.write_text(QUALITY.read_text(encoding="utf-8"), encoding="utf-8")
-    tmp = QUALITY.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(quality, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(QUALITY)
-    print(json.dumps({"translated": translated, "quality_total": len(quality)}, ensure_ascii=False))
+    tmp = CANDIDATES.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(candidates, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(CANDIDATES)
+    print(json.dumps({
+        "staged_for_review": translated,
+        "candidate_total": len(candidates),
+        "live_quality_unchanged": len(quality),
+    }, ensure_ascii=False))
+
 
 
 if __name__ == "__main__":
