@@ -45,6 +45,11 @@ npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @Le
 echo "[$(date -Is)] catalog quality normalization"
 timeout 180s node scripts/normalize-catalog-quality.mjs
 
+echo "[$(date -Is)] Russian content refresh"
+if ! timeout 150s "$ROOT/.venv-marian/bin/python" scripts/refresh-ru-content.py; then
+  echo "[$(date -Is)] WARN Russian content refresh failed; using last reviewed copy / structured fallback"
+fi
+
 # Official Argentina Georef reverse-geocoding is enrichment only. Keep the last
 # successful cache if the public API is temporarily unavailable.
 echo "[$(date -Is)] geo enrichment"
