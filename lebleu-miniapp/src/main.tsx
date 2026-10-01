@@ -258,6 +258,18 @@ function App(){
   },[viewMode]);
 
   useEffect(()=>{
+    if(viewMode!=='map') return;
+    const oldBody=document.body.style.overflow;
+    const oldHtml=document.documentElement.style.overflow;
+    document.body.style.overflow='hidden';
+    document.documentElement.style.overflow='hidden';
+    return ()=>{
+      document.body.style.overflow=oldBody;
+      document.documentElement.style.overflow=oldHtml;
+    };
+  },[viewMode]);
+
+  useEffect(()=>{
     if(savedOpen&&initData) loadSaved();
   },[savedOpen]);
 
