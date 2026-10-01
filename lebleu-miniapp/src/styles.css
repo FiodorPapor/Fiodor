@@ -83,3 +83,92 @@ button,input,select,textarea{font:inherit;color:inherit}
 .mapGroupPanel{position:absolute;z-index:5;left:10px;right:10px;bottom:10px;max-height:178px;padding:10px;border:1px solid var(--stroke);border-radius:16px;background:color-mix(in srgb,var(--bg) 96%,transparent);box-shadow:0 10px 34px rgba(0,0,0,.2);backdrop-filter:blur(18px)}
 .mapGroupHead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}.mapGroupHead strong{font-size:12px}.mapGroupHead button{width:28px;height:28px;border-radius:50%;background:var(--secondary);font-size:20px;line-height:1}
 .mapGroupList{display:flex;gap:7px;overflow-x:auto;scrollbar-width:none}.mapGroupList::-webkit-scrollbar{display:none}.mapGroupList>button{flex:0 0 145px;min-height:58px;padding:9px;text-align:left;border-radius:12px;background:var(--secondary);border:1px solid var(--stroke)}.mapGroupList span{display:block;font-size:13px;font-weight:850}.mapGroupList small{display:block;margin-top:4px;color:var(--hint);font-size:10px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+
+/* 2026-10-01 full-screen map + modern filters */
+.filterPrimary{
+  height:38px;padding:0 12px;border-radius:11px;background:var(--button);color:var(--buttonText);
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;font-size:12px;font-weight:800;white-space:nowrap
+}
+.filterPrimary b,.mapFilterBtn b{
+  min-width:19px;height:19px;padding:0 5px;border-radius:999px;display:grid;place-items:center;
+  background:rgba(255,255,255,.2);font-size:10px
+}
+.filterModeGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.filterModeGrid button{height:44px;border-radius:13px;background:var(--secondary);font-size:13px;font-weight:750}
+.filterModeGrid button.active{background:var(--button);color:var(--buttonText)}
+.filterStart{border-top:0;padding-top:4px}
+.typePresetRow{display:flex;gap:7px;overflow-x:auto;margin-bottom:10px;scrollbar-width:none}
+.typePresetRow::-webkit-scrollbar{display:none}
+.typePresetRow button{flex:0 0 auto;min-height:36px;padding:0 11px;border-radius:10px;background:var(--secondary);font-size:11px;font-weight:750;color:var(--link)}
+.filterHeadActions{display:flex!important;flex-direction:row!important;align-items:center;gap:7px}
+.resetFiltersBtn{background:transparent;color:var(--link);font-size:12px;font-weight:800;padding:8px}
+.mapFullscreen{
+  position:fixed;z-index:40;inset:0;height:100dvh;background:var(--secondary);overflow:hidden;
+}
+.mapFullscreen .mapShell{
+  position:absolute;inset:0;width:100%;height:100%;min-height:0;border:0;border-radius:0;box-shadow:none;
+}
+.mapFullscreen .catalogMap{inset:0}
+.mapTopOverlay{
+  position:absolute;z-index:8;left:0;right:0;top:0;
+  padding:calc(10px + var(--tg-content-safe-area-inset-top,env(safe-area-inset-top,0px))) 12px 8px;
+  display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;pointer-events:none;
+  background:linear-gradient(180deg,rgba(255,255,255,.94) 0%,rgba(255,255,255,.78) 68%,rgba(255,255,255,0) 100%);
+}
+.mapTopOverlay>*{pointer-events:auto}
+.mapBackBtn,.mapFilterBtn,.mapResultPill{
+  min-height:44px;border:1px solid rgba(0,0,0,.08);border-radius:14px;background:rgba(255,255,255,.94);
+  box-shadow:0 5px 18px rgba(0,0,0,.12);backdrop-filter:blur(16px)
+}
+.mapBackBtn,.mapFilterBtn{display:flex;align-items:center;justify-content:center;gap:6px;padding:0 12px;font-size:12px;font-weight:800}
+.mapBackBtn span,.mapFilterBtn span{display:inline}
+.mapFilterBtn{color:#fff;background:var(--button);border-color:transparent}
+.mapResultPill{justify-self:center;display:flex;align-items:center;gap:4px;padding:0 12px;color:#17191c}
+.mapResultPill strong{font-size:14px}.mapResultPill span{font-size:11px;color:#62676d}
+.mapFullscreen .maplibregl-ctrl-top-right{
+  top:calc(72px + var(--tg-content-safe-area-inset-top,env(safe-area-inset-top,0px)));right:10px
+}
+.mapFullscreen .mapHint{display:none}
+.mapBoot,.mapFailure{
+  position:absolute;z-index:4;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;padding:30px;text-align:center;background:var(--secondary);color:var(--hint)
+}
+.mapBoot{pointer-events:none}
+.mapFailure strong{color:var(--text);font-size:18px}
+.mapFailure span{max-width:300px;font-size:13px;line-height:1.45}
+.mapFailure>div{display:flex;gap:8px;margin-top:5px}
+.mapFallbackBtn{min-height:48px;padding:0 15px;border-radius:14px;background:var(--bg);border:1px solid var(--stroke);font-weight:750}
+.mapLoading.full{position:fixed;z-index:41;inset:0;height:100dvh;border-radius:0}
+.mapFullscreen .mapGroupPanel{bottom:calc(12px + var(--tg-content-safe-area-inset-bottom,env(safe-area-inset-bottom,0px)))}
+@media(max-width:659px){
+  .resultHeader{display:block;padding-top:14px}
+  .resultCount{margin-bottom:9px}
+  .resultActions{display:grid;grid-template-columns:auto minmax(0,1fr) auto;width:100%}
+  .filterPrimary{height:42px}
+  .sortSelect{height:42px;max-width:none;width:100%}
+  .viewToggle{grid-template-columns:40px 40px}
+  .viewToggle button{height:34px}
+  .filterOverlay{align-items:stretch;padding:0;background:var(--bg)}
+  .filterSheet{
+    width:100%;height:100dvh;max-height:none!important;border-radius:0;padding:
+    calc(8px + var(--tg-content-safe-area-inset-top,env(safe-area-inset-top,0px))) 16px
+    calc(12px + var(--tg-content-safe-area-inset-bottom,env(safe-area-inset-bottom,0px)));
+    animation:none
+  }
+  .filterSheet>.sheetHandle{display:none}
+  .filterSheetHead{padding:4px 0 12px}
+  .filterSheet .sheetScroll{padding-bottom:18px}
+  .filterSheet .sheetFooter{padding-top:10px;background:var(--bg)}
+  .mapBackBtn span{display:none}
+}
+
+.viewToggle{grid-template-columns:auto auto}
+.viewToggle button{min-width:64px;padding:0 9px;display:flex;align-items:center;justify-content:center;gap:5px;font-size:11px;font-weight:750}
+@media(max-width:659px){
+  .resultActions{grid-template-columns:1fr auto;grid-template-areas:"filter view" "sort sort";gap:7px}
+  .filterPrimary{grid-area:filter}
+  .sortSelect{grid-area:sort}
+  .viewToggle{grid-area:view}
+  .viewToggle button{min-width:62px}
+}
