@@ -239,11 +239,23 @@ function App(){
       else if(savedOpen) setSavedOpen(false);
       else if(questionOpen) setQuestionOpen(false);
       else if(actionSuccess) setActionSuccess('');
+      else if(viewMode==='map') setViewMode('list');
     };
-    if(selected||filtersOpen||saveOpen||savedOpen||questionOpen||actionSuccess){tg.BackButton.show(); tg.BackButton.onClick(goBack);}
-    else tg.BackButton.hide();
+    if(selected||filtersOpen||saveOpen||savedOpen||questionOpen||actionSuccess||viewMode==='map'){
+      tg.BackButton.show();
+      tg.BackButton.onClick(goBack);
+    } else tg.BackButton.hide();
     return ()=>{try{tg.BackButton.offClick(goBack);}catch{}};
-  },[selected,filtersOpen,saveOpen,savedOpen,questionOpen,actionSuccess]);
+  },[selected,filtersOpen,saveOpen,savedOpen,questionOpen,actionSuccess,viewMode]);
+
+  useEffect(()=>{
+    if(!tg)return;
+    try{
+      if(viewMode==='map')tg.disableVerticalSwipes?.();
+      else tg.enableVerticalSwipes?.();
+    }catch{}
+    return ()=>{try{tg.enableVerticalSwipes?.();}catch{}};
+  },[viewMode]);
 
   useEffect(()=>{
     if(savedOpen&&initData) loadSaved();
@@ -525,16 +537,20 @@ function App(){
       </div>
 
       <div className="quickRow">
-        {quickHoods.map(hood=><button key={hood} className={filters.neighborhoods.includes(hood)?'chip active':'chip'}
-          onClick={()=>toggleNeighborhood(hood)}>{prettyHood(hood)}</button>)}
         <button className={activeFilterCount(filters)>0?'chip filterChip active':'chip filterChip'} onClick={()=>setFiltersOpen(true)}>
           <SlidersHorizontal size={15}/> Фильтры {activeFilterCount(filters)>0&&<b>{activeFilterCount(filters)}</b>}
         </button>
+        {quickHoods.map(hood=><button key={hood} className={filters.neighborhoods.includes(hood)?'chip active':'chip'}
+          onClick={()=>toggleNeighborhood(hood)}>{prettyHood(hood)}</button>)}
       </div>
 
       <div className="resultHeader">
         <div className="resultCount"><strong>{results.length}</strong><span> {plural(results.length,'объект','объекта','объектов')}</span></div>
         <div className="resultActions">
+          <button className="filterPrimary" onClick={()=>setFiltersOpen(true)}>
+            <SlidersHorizontal size={16}/> Фильтры
+            {activeFilterCount(filters)>0&&<b>{activeFilterCount(filters)}</b>}
+          </button>
           <select className="sortSelect" value={filters.sort} onChange={e=>update({sort:e.target.value})} aria-label="Сортировка">
             <option value="recommended">Сначала рекомендуемые</option>
             <option value="price_asc">Цена: ниже</option>
@@ -542,8 +558,8 @@ function App(){
             <option value="area_desc">Площадь: больше</option>
           </select>
           <div className="viewToggle" aria-label="Вид каталога">
-            <button className={viewMode==='list'?'active':''} onClick={()=>setViewMode('list')} aria-label="Список"><List size={16}/></button>
-            <button className={viewMode==='map'?'active':''} onClick={()=>setViewMode('map')} aria-label="Карта"><MapIcon size={16}/></button>
+            <button className={viewMode==='list'?'active':''} onClick={()=>setViewMode('list')} aria-label="Список"><List size={16}/><span>Список</span></button>
+            <button className={viewMode==='map'?'active':''} onClick={()=>setViewMode('map')} aria-label="Карта"><MapIcon size={16}/><span>Карта</span></button>
           </div>
         </div>
       </div>
@@ -552,24 +568,34 @@ function App(){
         <button onClick={()=>{setFilters(DEFAULT_FILTERS);searchStarted.current=false}}>Сбросить всё</button>
       </div>}
 
-      {viewMode==='map'&&results.length>0
-        ?<React.Suspense fallback={<div className="mapLoading"><div className="spinner"/><span>Загружаем карту…</span></div>}>
-          <CatalogMap items={results} onOpen={item=>openListing(item as Listing)}/>
-        </React.Suspense>
-        :<section className="cards">
-          {results.map(item=><ListingCard key={listingKey(item)} item={item} onOpen={()=>openListing(item)}/>)}
-          {!results.length&&<div className="emptyState">
-            <div className="emptyIcon"><Search size={26}/></div>
-            <h3>Точного совпадения нет</h3>
-            <p>{canSaveSearch(filters)
-              ?'Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.'
-              :'Добавьте район, тип объекта, комнаты, бюджет или поисковый запрос, чтобы сохранить поиск.'}</p>
-            {canSaveSearch(filters)&&<button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>}
-          </div>}
-        </section>}
+      <section className="cards">
+        {results.map(item=><ListingCard key={listingKey(item)} item={item} onOpen={()=>openListing(item)}/>)}
+        {!results.length&&<div className="emptyState">
+          <div className="emptyIcon"><Search size={26}/></div>
+          <h3>Точного совпадения нет</h3>
+          <p>{canSaveSearch(filters)
+            ?'Сохраните этот поиск. Если подходящий объект появится, мы сможем сообщить вам в Telegram.'
+            :'Добавьте район, тип объекта, комнаты, бюджет или поисковый запрос, чтобы сохранить поиск.'}</p>
+          {canSaveSearch(filters)&&<button className="primary" onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск</button>}
+        </div>}
+      </section>
     </main>
 
-    {canSaveSearch(filters)&&results.length>0&&
+    {viewMode==='map'&&<div className="mapFullscreen">
+      <React.Suspense fallback={<div className="mapLoading full"><div className="spinner"/><span>Загружаем карту…</span></div>}>
+        <CatalogMap items={results} onOpen={item=>openListing(item as Listing)} onFallback={()=>setViewMode('list')}/>
+      </React.Suspense>
+      <div className="mapTopOverlay">
+        <button className="mapBackBtn" onClick={()=>setViewMode('list')}><ArrowLeft size={20}/><span>Список</span></button>
+        <div className="mapResultPill"><strong>{results.length}</strong><span> {plural(results.length,'объект','объекта','объектов')}</span></div>
+        <button className="mapFilterBtn" onClick={()=>setFiltersOpen(true)}>
+          <SlidersHorizontal size={18}/><span>Фильтры</span>
+          {activeFilterCount(filters)>0&&<b>{activeFilterCount(filters)}</b>}
+        </button>
+      </div>
+    </div>}
+
+    {viewMode==='list'&&canSaveSearch(filters)&&results.length>0&&
       <div className="stickySave"><button onClick={()=>setSaveOpen(true)}><Bell size={18}/> Сохранить поиск <span>{results.length}</span></button></div>}
 
     {filtersOpen&&<FilterSheet filters={filters} propertyTypes={propertyTypes} neighborhoods={catalog.neighborhoods}
@@ -680,11 +706,28 @@ function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate
   const visibleNeighborhoods=neighborhoods.filter((x:string)=>
     !hoodQuery.trim()||normalizedSearch(prettyHood(x)).includes(normalizedSearch(hoodQuery))
   );
-  return <div className="overlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
+  const residentialTypes=propertyTypes.filter((x:string)=>['Departamento','Casa','PH'].includes(x));
+  const commercialTypes=propertyTypes.filter((x:string)=>['Local Comercial','Oficina'].includes(x));
+  const landTypes=propertyTypes.filter((x:string)=>['Terreno o Lote','Campo','Cochera'].includes(x));
+  return <div className="overlay filterOverlay" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}>
     <div className="sheet filterSheet">
       <div className="sheetHandle"/>
-      <div className="sheetHead"><div><span>Фильтры</span><strong>{count} объектов сейчас</strong></div><button className="roundBtn" onClick={onClose}><X size={20}/></button></div>
+      <div className="sheetHead filterSheetHead">
+        <div><span>Фильтры</span><strong>{count} объектов сейчас</strong></div>
+        <div className="filterHeadActions">
+          {activeFilterCount(filters)>0&&<button className="resetFiltersBtn" onClick={()=>onUpdate({...DEFAULT_FILTERS})}>Сбросить</button>}
+          <button className="roundBtn" onClick={onClose}><X size={20}/></button>
+        </div>
+      </div>
       <div className="sheetScroll">
+        <section className="filterSection filterStart">
+          <h3>Что ищете?</h3>
+          <div className="filterModeGrid">
+            {[['','Все объекты'],['Venta','Купить'],['Alquiler','Арендовать']].map(([value,label])=>
+              <button key={value} className={filters.operation===value?'active':''} onClick={()=>onUpdate({operation:value})}>{label}</button>
+            )}
+          </div>
+        </section>
         <section className="filterSection">
           <h3>Район / город <small className="filterHint">можно выбрать несколько</small></h3>
           <div className="filterSearch">
@@ -696,9 +739,16 @@ function FilterSheet({filters,propertyTypes,neighborhoods,count,onClose,onUpdate
             {visibleNeighborhoods.map((x:string)=><button key={x} className={filters.neighborhoods.includes(x)?'chip active':'chip'} onClick={()=>onToggleHood(x)}>{prettyHood(x)}</button>)}
           </div>
         </section>
-        <section className="filterSection"><h3>Тип объекта</h3><div className="chipsWrap">
-          {propertyTypes.map((x:string)=><button key={x} className={filters.propertyTypes.includes(x)?'chip active':'chip'} onClick={()=>onToggleType(x)}>{translateType(x)}</button>)}
-        </div></section>
+        <section className="filterSection"><h3>Тип объекта</h3>
+          <div className="typePresetRow">
+            {!!residentialTypes.length&&<button onClick={()=>onUpdate({propertyTypes:residentialTypes})}>Жилая</button>}
+            {!!commercialTypes.length&&<button onClick={()=>onUpdate({propertyTypes:commercialTypes})}>Коммерческая</button>}
+            {!!landTypes.length&&<button onClick={()=>onUpdate({propertyTypes:landTypes})}>Земля / паркинг</button>}
+          </div>
+          <div className="chipsWrap">
+            {propertyTypes.map((x:string)=><button key={x} className={filters.propertyTypes.includes(x)?'chip active':'chip'} onClick={()=>onToggleType(x)}>{translateType(x)}</button>)}
+          </div>
+        </section>
         <section className="filterSection"><h3>Цена</h3>
           <div className="currencyTabs">
             {['USD','ARS'].map((cur:string)=><button key={cur} className={filters.budgetCurrency===cur?'active':''} onClick={()=>onUpdate({budgetCurrency:cur})}>{cur}</button>)}
@@ -769,7 +819,7 @@ function translateType(x:string){
   return ({
     Departamento:'Квартира',Casa:'Дом',PH:'PH',Cochera:'Парковка',
     'Local Comercial':'Коммерция',Local:'Коммерция',
-    'Terreno o Lote':'Участок',Terreno:'Участок',
+    'Terreno o Lote':'Участок',Terreno:'Участок',Campo:'Земля / поле',
     Oficina:'Офис','Depósito':'Склад',Propiedad:'Недвижимость'
   } as any)[x]||x;
 }
