@@ -244,6 +244,9 @@ FEATURE_ALIASES = {
     "apto_credito": ["apto crédito", "apto credito"],
     "apto_profesional": ["apto profesional"],
     "calefaccion": ["calefacción", "calefaccion"],
+    "ascensor": ["ascensor"],
+    "seguridad": ["seguridad 24", "seguridad las 24"],
+    "a_estrenar": ["a estrenar"],
 }
 
 
@@ -603,7 +606,7 @@ def _match(item: dict[str, Any], criteria: dict[str, Any]) -> bool:
     query = _norm(criteria.get("query"))
     if query:
         tokens = [x for x in re.findall(r"[a-záéíóúñüа-я0-9]{3,}", query) if x not in {"квартира", "квартиру", "дом", "ищу", "нужна"}]
-        if tokens and not any(token in blob for token in tokens):
+        if tokens and not all(token in blob for token in tokens):
             return False
     return True
 
