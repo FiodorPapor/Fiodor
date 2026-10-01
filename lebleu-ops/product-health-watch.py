@@ -15,6 +15,7 @@ PUBLISHER_STATE = ROOT / "state/telegram-state.json"
 GEO_ENRICHMENT = ROOT / "state/geo-enrichment.json"
 SOURCE_FAILURES = ROOT / "public/data/full/failures.json"
 CATALOG_QUALITY = ROOT / "state/catalog-quality.json"
+RU_CONTENT_QUALITY = ROOT / "state/ru-content-quality.json"
 CATALOG_ALIASES = ROOT / "public/data/full/catalog-aliases.json"
 CHANNEL_INTEGRITY = ROOT / "state/channel-integrity.json"
 USER_DELETE_QUEUE = ROOT / "state/telegram-user-delete-queue.json"
@@ -124,6 +125,7 @@ def main() -> int:
     if rc != 0 or digest_active != "active":
         issues.append("Growth digest timer не active")
 
+    catalog: list[dict] = []
     if not CATALOG.exists():
         issues.append("catalog.json отсутствует")
         catalog_count = 0
@@ -152,6 +154,28 @@ def main() -> int:
     if CATALOG_QUALITY.exists() and CATALOG.exists():
         if CATALOG_QUALITY.stat().st_mtime + 5 < CATALOG.stat().st_mtime:
             issues.append("quality report старее catalog.json")
+
+    ru_quality = load_json(RU_CONTENT_QUALITY, {})
+    ru_missing = 0
+    ru_stale = 0
+    ru_non_russian = 0
+    if isinstance(catalog, list) and isinstance(ru_quality, dict):
+        for item in catalog:
+            row = ru_quality.get(item.get("sourceUrl")) or {}
+            summary = str(row.get("summary_ru") or "").strip()
+            if not summary:
+                ru_missing += 1
+                continue
+            if row.get("sourceFingerprint") and row.get("sourceFingerprint") != item.get("sourceFingerprint"):
+                ru_stale += 1
+            if not any("А" <= ch <= "я" or ch in "Ёё" for ch in summary):
+                ru_non_russian += 1
+    else:
+        ru_missing = catalog_count
+    if ru_missing or ru_stale or ru_non_russian:
+        issues.append(
+            f"русский контент неполный: missing={ru_missing}, stale={ru_stale}, non_ru={ru_non_russian}"
+        )
 
     alias_payload = load_json(CATALOG_ALIASES, {})
     aliases = alias_payload.get("aliases", {}) if isinstance(alias_payload, dict) else {}
@@ -245,6 +269,9 @@ def main() -> int:
         "quality_suppressed_count": quality_suppressed_count,
         "quality_duplicate_photos_removed": quality_photo_drops,
         "quality_image_errors": quality_image_errors,
+        "ru_content_missing": ru_missing,
+        "ru_content_stale": ru_stale,
+        "ru_content_non_russian": ru_non_russian,
         "alias_count": alias_count,
         "pending_user_delete_count": pending_user_delete_count,
         "channel_integrity_healthy": (
