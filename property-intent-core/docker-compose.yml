@@ -25,9 +25,11 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - ${CATALOG_HOST_PATH:-/opt/lebleu-listing-bridge/public/data/full/catalog.json}:/data/catalog.json:ro
-      - ${QUALITY_HOST_PATH:-/opt/lebleu-listing-bridge/state/ru-content-quality.json}:/data/quality.json:ro
-      - ${GEO_HOST_PATH:-/opt/lebleu-listing-bridge/state/geo-enrichment.json}:/data/geo-enrichment.json:ro
+      # Mount directories, not individual files. The catalog/quality pipeline
+      # updates JSON atomically with rename(); directory mounts make those new
+      # inodes visible inside the container immediately.
+      - /opt/lebleu-listing-bridge/public/data/full:/data/catalog:ro
+      - /opt/lebleu-listing-bridge/state:/data/state:ro
     ports:
       - "127.0.0.1:${HOST_PORT:-8050}:8080"
     networks:
