@@ -26,6 +26,7 @@ for _ in $(seq 1 30); do
     curl -fsS --max-time 3 https://lebleu-app.srv1636153.hstgr.cloud/api/v1/catalog |
       python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["count"]>0; print("lebleu-miniapp healthy",d["count"])'
     python3 scripts/smoke-test.py
+    python3 scripts/map-proxy-smoke.py
     exit 0
   fi
   sleep 1
