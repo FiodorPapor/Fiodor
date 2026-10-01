@@ -160,7 +160,7 @@ button,input,select,textarea{font:inherit;color:inherit}
   .filterSheetHead{padding:4px 0 12px}
   .filterSheet .sheetScroll{padding-bottom:18px}
   .filterSheet .sheetFooter{padding-top:10px;background:var(--bg)}
-  .mapBackBtn span{display:none}
+  .mapBackBtn span{display:inline}
 }
 
 .viewToggle{grid-template-columns:auto auto}
