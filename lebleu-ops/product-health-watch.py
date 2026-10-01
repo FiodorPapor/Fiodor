@@ -261,6 +261,11 @@ def main() -> int:
     if not miniapp_ok:
         issues.append(f"Mini App boot unhealthy: {miniapp_detail}")
 
+    map_rc, map_detail = cmd("python3", "/opt/lebleu-miniapp/scripts/map-proxy-smoke.py")
+    map_proxy_ok = map_rc == 0
+    if not map_proxy_ok:
+        issues.append(f"Mini App map proxy unhealthy: {map_detail[:180]}")
+
     current_status = "unhealthy" if issues else "healthy"
     previous_status = previous.get("status")
     previous_issues = previous.get("issues") or []
@@ -299,6 +304,7 @@ def main() -> int:
         "alias_count": alias_count,
         "pending_user_delete_count": pending_user_delete_count,
         "stale_interactive_repl_count": len(stale_repls),
+        "map_proxy_healthy": map_proxy_ok,
         "channel_integrity_healthy": (
             channel_integrity.get("healthy") if isinstance(channel_integrity, dict) and channel_integrity else None
         ),
