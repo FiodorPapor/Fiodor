@@ -650,7 +650,6 @@ def _validate_init_data(raw: str) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Telegram authorization required")
     pairs = dict(parse_qsl(raw, keep_blank_values=True))
     received_hash = pairs.pop("hash", "")
-    pairs.pop("signature", None)
     if not received_hash:
         raise HTTPException(status_code=401, detail="Missing Telegram hash")
     data_check = "\n".join(f"{key}={value}" for key, value in sorted(pairs.items()))
