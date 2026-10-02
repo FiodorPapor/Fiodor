@@ -1142,8 +1142,8 @@ def handle_message(
         try:
             item = _lebleu_listing(lebleu_code)
             tracking_token = str((tracking or {}).get("token") or "") or None
-            raw_code = str(item.get("code") or lebleu_code.split("_", 1)[0])
-            miniapp_url = f"https://lebleu-app.srv1636153.hstgr.cloud/?v=20261001d&listing={quote(raw_code)}"
+            listing_token = str(lebleu_code or item.get("code") or "")
+            miniapp_url = f"https://lebleu-app.srv1636153.hstgr.cloud/?v=20261002a&listing={quote(listing_token)}"
             if tracking_token:
                 miniapp_url += f"&trk={quote(tracking_token)}"
             providers.telegram.send_text(
@@ -1170,7 +1170,7 @@ def handle_message(
             logger.warning("telegram_lebleu_welcome_failed", error=str(exc)[:200])
     elif result.created and update.text and update.text.strip().startswith("/start") and update.chat_id:
         try:
-            miniapp_url = "https://lebleu-app.srv1636153.hstgr.cloud/?v=20261001d"
+            miniapp_url = "https://lebleu-app.srv1636153.hstgr.cloud/?v=20261002a"
             if tracking and tracking.get("token"):
                 miniapp_url += f"&trk={tracking['token']}"
             acquisition_entry = bool(tracking and tracking.get("intent") == "miniapp")
