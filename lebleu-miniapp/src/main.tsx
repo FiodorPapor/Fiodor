@@ -188,6 +188,7 @@ function App(){
   const [toast,setToast]=useState('');
   const [busy,setBusy]=useState(false);
   const [viewMode,setViewMode]=useState<'list'|'map'>('list');
+  const mapViewportRef=useRef<{center:[number,number];zoom:number}|null>(null);
   const [questionOpen,setQuestionOpen]=useState(false);
   const [questionText,setQuestionText]=useState('');
   const [actionSuccess,setActionSuccess]=useState('');
@@ -251,14 +252,14 @@ function App(){
   useEffect(()=>{
     if(!tg)return;
     try{
-      if(viewMode==='map')tg.disableVerticalSwipes?.();
+      if(viewMode==='map'||selected)tg.disableVerticalSwipes?.();
       else tg.enableVerticalSwipes?.();
     }catch{}
     return ()=>{try{tg.enableVerticalSwipes?.();}catch{}};
-  },[viewMode]);
+  },[viewMode,selected]);
 
   useEffect(()=>{
-    if(viewMode!=='map') return;
+    if(viewMode!=='map'||selected) return;
     const oldBody=document.body.style.overflow;
     const oldHtml=document.documentElement.style.overflow;
     document.body.style.overflow='hidden';
@@ -267,7 +268,7 @@ function App(){
       document.body.style.overflow=oldBody;
       document.documentElement.style.overflow=oldHtml;
     };
-  },[viewMode]);
+  },[viewMode,selected]);
 
   useEffect(()=>{
     if(savedOpen&&initData) loadSaved();
@@ -595,7 +596,8 @@ function App(){
 
     {viewMode==='map'&&<div className="mapFullscreen">
       <React.Suspense fallback={<div className="mapLoading full"><div className="spinner"/><span>Загружаем карту…</span></div>}>
-        <CatalogMap items={results} onOpen={item=>openListing(item as Listing)} onFallback={()=>setViewMode('list')}/>
+        <CatalogMap items={results} onOpen={item=>openListing(item as Listing)} onFallback={()=>setViewMode('list')}
+          initialViewport={mapViewportRef.current} onViewportChange={value=>{mapViewportRef.current=value}}/>
       </React.Suspense>
       <div className="mapTopOverlay">
         <button className="mapBackBtn" onClick={()=>setViewMode('list')}><ArrowLeft size={20}/><span>Список</span></button>
