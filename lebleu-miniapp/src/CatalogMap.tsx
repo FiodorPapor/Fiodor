@@ -6,14 +6,14 @@ import LayerGroup from 'ol/layer/Group.js';
 import {defaults as defaultControls} from 'ol/control/defaults.js';
 import {defaults as defaultInteractions} from 'ol/interaction/defaults.js';
 import {boundingExtent} from 'ol/extent.js';
-import {fromLonLat} from 'ol/proj.js';
+import {fromLonLat,toLonLat} from 'ol/proj.js';
 import {apply} from 'ol-mapbox-style';
 import {LocateFixed} from 'lucide-react';
 import 'ol/ol.css';
 
 export type MapListing={
   listingToken:string;code:string;address:string;priceAmount:string;priceCurrency:string;
-  propertyType?:string;operation?:string;details?:Record<string,number>;
+  propertyType?:string;operation?:string;details?:Record<string,number>;images?:string[];
   latitude?:number|null;longitude?:number|null;
 };
 
@@ -47,11 +47,13 @@ function focusItems(items:MapListing[]){
 }
 
 export default function CatalogMap({
-  items,onOpen,onFallback,
+  items,onOpen,onFallback,initialViewport,onViewportChange,
 }:{
   items:MapListing[];
   onOpen:(item:MapListing)=>void;
   onFallback?:()=>void;
+  initialViewport?:{center:[number,number];zoom:number}|null;
+  onViewportChange?:(value:{center:[number,number];zoom:number})=>void;
 }){
   const containerRef=useRef<HTMLDivElement|null>(null);
   const mapRef=useRef<OLMap|null>(null);
@@ -62,9 +64,14 @@ export default function CatalogMap({
   const [failure,setFailure]=useState('');
   const [degraded,setDegraded]=useState('');
   const [locating,setLocating]=useState(false);
+  const [mapZoom,setMapZoom]=useState(initialViewport?.zoom??10.7);
   const [retryKey,setRetryKey]=useState(0);
   const onOpenRef=useRef(onOpen);
+  const onViewportRef=useRef(onViewportChange);
+  const restoredViewportRef=useRef(Boolean(initialViewport));
+  const lastItemsKeyRef=useRef('');
   onOpenRef.current=onOpen;
+  onViewportRef.current=onViewportChange;
 
   useEffect(()=>{
     const node=containerRef.current;
@@ -82,8 +89,8 @@ export default function CatalogMap({
         target:node,
         layers:[baseGroup],
         view:new View({
-          center:fromLonLat([-58.43,-34.60]),
-          zoom:10.7,
+          center:fromLonLat(initialViewport?.center||[-58.43,-34.60]),
+          zoom:initialViewport?.zoom??10.7,
           minZoom:3,
           maxZoom:18,
         }),
@@ -134,12 +141,16 @@ export default function CatalogMap({
       });
 
     const resize=()=>map.updateSize();
+    const moved=()=>{const c=map.getView().getCenter(),z=map.getView().getZoom();if(c&&z!=null){const p=toLonLat(c);if(onViewportRef.current)onViewportRef.current({center:[p[0],p[1]],zoom:z});setMapZoom(Math.round(z*2)/2);}};
     window.addEventListener('resize',resize,{passive:true});
+    map.on('moveend',moved);
 
     return ()=>{
       cancelled=true;
       window.clearTimeout(slowStyle);
       window.removeEventListener('resize',resize);
+      map.un('moveend',moved);
+      moved();
       markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
       markerOverlaysRef.current=[];
       if(userOverlayRef.current){
@@ -162,9 +173,13 @@ export default function CatalogMap({
     const valid=items.filter(x=>
       Number.isFinite(Number(x.longitude))&&Number.isFinite(Number(x.latitude))
     );
+    const itemsKey=items.map(x=>x.listingToken).join('|');
+    const itemsChanged=lastItemsKeyRef.current!==itemsKey;
+    lastItemsKeyRef.current=itemsKey;
+    const precision=mapZoom>=15.5?5:mapZoom>=13.5?4:mapZoom>=11.5?3:2;
     const groups=new Map<string,MapListing[]>();
     for(const item of valid){
-      const key=Number(item.longitude).toFixed(5)+','+Number(item.latitude).toFixed(5);
+      const key=Number(item.longitude).toFixed(precision)+','+Number(item.latitude).toFixed(precision);
       const group=groups.get(key)||[];
       group.push(item);
       groups.set(key,group);
@@ -175,35 +190,47 @@ export default function CatalogMap({
       const item=group[0];
       const el=document.createElement('button');
       el.type='button';
-      el.className=group.length>1?'priceMarker groupMarker':'priceMarker';
-      el.textContent=group.length>1?(group.length+' вариантов'):compactPrice(item);
+      el.className=group.length>1?'priceMarker clusterMarker':'priceMarker';
+      el.textContent=group.length>1?String(group.length):compactPrice(item);
       el.setAttribute('aria-label',group.length>1
         ?(group.length+' объектов · '+(item.address||item.code))
         :(item.address||item.code));
       el.onclick=e=>{
         e.preventDefault();
         e.stopPropagation();
-        if(group.length===1)onOpenRef.current(item);
-        else setSelectedGroup(group);
+        if(group.length===1){onOpenRef.current(item);return;}
+        const unique=new Set(group.map(x=>Number(x.longitude).toFixed(5)+','+Number(x.latitude).toFixed(5)));
+        const zoom=map.getView().getZoom()||mapZoom;
+        if(unique.size>1&&zoom<15.5){
+          const coords=group.map(x=>fromLonLat([Number(x.longitude),Number(x.latitude)]));
+          map.getView().fit(boundingExtent(coords),{padding:[110,60,150,60],maxZoom:Math.min(16,zoom+2.5),duration:260});
+        }else setSelectedGroup(group);
       };
+      const markerLon=group.reduce((sum,x)=>sum+Number(x.longitude),0)/group.length;
+      const markerLat=group.reduce((sum,x)=>sum+Number(x.latitude),0)/group.length;
       const overlay=new Overlay({
         element:el,
         positioning:'center-center',
         stopEvent:true,
-        position:fromLonLat([Number(item.longitude),Number(item.latitude)]),
+        position:fromLonLat([markerLon,markerLat]),
       });
       map.addOverlay(overlay);
       markerOverlaysRef.current.push(overlay);
     }
 
     const focus=focusItems(valid);
-    if(focus.length===1){
+    if(restoredViewportRef.current){
+      restoredViewportRef.current=false;
+    }else if(itemsChanged&&valid.length>36){
+      const center=[median(valid.map(x=>Number(x.longitude))),median(valid.map(x=>Number(x.latitude)))];
+      map.getView().animate({center:fromLonLat(center),zoom:10.8,duration:260});
+    }else if(itemsChanged&&focus.length===1){
       map.getView().animate({
         center:fromLonLat([Number(focus[0].longitude),Number(focus[0].latitude)]),
         zoom:14,
         duration:280,
       });
-    }else if(focus.length>1){
+    }else if(itemsChanged&&focus.length>1){
       const coordinates=focus.map(item=>
         fromLonLat([Number(item.longitude),Number(item.latitude)])
       );
@@ -219,35 +246,57 @@ export default function CatalogMap({
       markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
       markerOverlaysRef.current=[];
     };
-  },[items,retryKey]);
+  },[items,retryKey,mapZoom]);
 
-  function locate(){
+  async function locate(){
     const map=mapRef.current;
-    if(!map||!navigator.geolocation||locating)return;
+    if(!map||locating)return;
     setLocating(true);
-    navigator.geolocation.getCurrentPosition(position=>{
-      setLocating(false);
-      const coordinate=fromLonLat([position.coords.longitude,position.coords.latitude]);
+    setDegraded('');
+    try{
+      const manager=window.Telegram?.WebApp?.LocationManager;
+      let location:any=null;
+      if(manager?.init&&manager?.getLocation){
+        location=await new Promise<any>((resolve,reject)=>{
+          let retries=0;
+          const request=()=>{
+            if(manager.isLocationAvailable===false){reject(new Error('Геолокация недоступна'));return;}
+            manager.getLocation((data:any)=>{
+              if(data){resolve(data);return;}
+              if(retries<1){retries++;window.setTimeout(request,550);return;}
+              reject(new Error('Не удалось определить геопозицию'));
+            });
+          };
+          try{
+            if(manager.isInited)request();
+            else manager.init(request);
+          }catch(error){reject(error);}
+        });
+      }
+      if(!location){
+        location=await new Promise<any>((resolve,reject)=>{
+          if(!navigator.geolocation){reject(new Error('Геолокация недоступна'));return;}
+          navigator.geolocation.getCurrentPosition(
+            p=>resolve({latitude:p.coords.latitude,longitude:p.coords.longitude}),
+            ()=>reject(new Error('Не удалось определить геопозицию')),
+            {enableHighAccuracy:false,timeout:9000,maximumAge:120000},
+          );
+        });
+      }
+      const coordinate=fromLonLat([Number(location.longitude),Number(location.latitude)]);
       if(userOverlayRef.current)map.removeOverlay(userOverlayRef.current);
       const el=document.createElement('div');
       el.className='userLocationDot';
-      const overlay=new Overlay({
-        element:el,
-        positioning:'center-center',
-        stopEvent:false,
-        position:coordinate,
-      });
+      const overlay=new Overlay({element:el,positioning:'center-center',stopEvent:false,position:coordinate});
       map.addOverlay(overlay);
       userOverlayRef.current=overlay;
-      map.getView().animate({center:coordinate,zoom:14,duration:350});
-    },()=>{
+      map.getView().animate({center:coordinate,zoom:14.4,duration:320});
+    }catch{
+      setDegraded('Не удалось определить геопозицию');
+      window.setTimeout(()=>setDegraded(''),3200);
+    }finally{
       setLocating(false);
-      setDegraded('Не удалось получить геопозицию. Можно продолжать искать по карте.');
-    },{
-      enableHighAccuracy:false,
-      timeout:7000,
-      maximumAge:120000,
-    });
+    }
   }
 
   const hasGeo=items.some(x=>
@@ -270,14 +319,14 @@ export default function CatalogMap({
     {ready&&!!degraded&&<div className="mapDegraded">{degraded}</div>}
 
     {ready&&<button className="mapLocateBtn" onClick={locate} disabled={locating} aria-label="Моё местоположение">
-      <LocateFixed size={18}/><span>{locating?'Ищем…':'Рядом со мной'}</span>
+      <LocateFixed size={18}/><span>{locating?'Ищем…':'Моё место'}</span>
     </button>}
 
     {!hasGeo&&<div className="mapEmpty">У выбранных объектов пока нет координат</div>}
 
     {!!selectedGroup.length&&<div className="mapGroupPanel">
       <div className="mapGroupHead">
-        <strong>{selectedGroup.length} вариантов по этому адресу</strong>
+        <strong>{selectedGroup.length} объектов рядом</strong>
         <button onClick={()=>setSelectedGroup([])}>×</button>
       </div>
       <div className="mapGroupList">
