@@ -42,6 +42,7 @@ def signed_init_data(token:str, user_id:int)->str:
     pairs={
         "auth_date":str(int(time.time())),
         "query_id":"LEBLEU_SMOKE",
+        "signature":"qa-third-party-signature-field",
         "user":json.dumps(user,separators=(",",":"),ensure_ascii=False),
     }
     check="\n".join(f"{k}={v}" for k,v in sorted(pairs.items()))
