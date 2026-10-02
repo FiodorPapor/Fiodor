@@ -1,11 +1,15 @@
 import React,{useEffect,useRef,useState} from 'react';
-import {
-  GeolocateControl,LngLatBounds,Map as MapLibreMap,Marker,NavigationControl,setWorkerUrl
-} from 'maplibre-gl';
-import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-import 'maplibre-gl/dist/maplibre-gl.css';
-
-setWorkerUrl(workerUrl);
+import OLMap from 'ol/Map.js';
+import View from 'ol/View.js';
+import Overlay from 'ol/Overlay.js';
+import LayerGroup from 'ol/layer/Group.js';
+import {defaults as defaultControls} from 'ol/control/defaults.js';
+import {defaults as defaultInteractions} from 'ol/interaction/defaults.js';
+import {boundingExtent} from 'ol/extent.js';
+import {fromLonLat} from 'ol/proj.js';
+import {apply} from 'ol-mapbox-style';
+import {LocateFixed} from 'lucide-react';
+import 'ol/ol.css';
 
 export type MapListing={
   listingToken:string;code:string;address:string;priceAmount:string;priceCurrency:string;
@@ -21,12 +25,14 @@ function compactPrice(item:MapListing){
   if(n>=1000)return prefix+Math.round(n/1000)+'k';
   return prefix+Math.round(n);
 }
+
 function median(values:number[]){
   if(!values.length)return 0;
   const sorted=[...values].sort((a,b)=>a-b);
   const mid=Math.floor(sorted.length/2);
   return sorted.length%2?sorted[mid]:(sorted[mid-1]+sorted[mid])/2;
 }
+
 function focusItems(items:MapListing[]){
   if(items.length<=40)return items;
   const centerLat=median(items.map(x=>Number(x.latitude)));
@@ -48,11 +54,14 @@ export default function CatalogMap({
   onFallback?:()=>void;
 }){
   const containerRef=useRef<HTMLDivElement|null>(null);
-  const mapRef=useRef<MapLibreMap|null>(null);
-  const markersRef=useRef<Marker[]>([]);
+  const mapRef=useRef<OLMap|null>(null);
+  const markerOverlaysRef=useRef<Overlay[]>([]);
+  const userOverlayRef=useRef<Overlay|null>(null);
   const [selectedGroup,setSelectedGroup]=useState<MapListing[]>([]);
   const [ready,setReady]=useState(false);
   const [failure,setFailure]=useState('');
+  const [degraded,setDegraded]=useState('');
+  const [locating,setLocating]=useState(false);
   const [retryKey,setRetryKey]=useState(0);
   const onOpenRef=useRef(onOpen);
   onOpenRef.current=onOpen;
@@ -62,71 +71,83 @@ export default function CatalogMap({
     if(!node)return;
     setReady(false);
     setFailure('');
-    let timedOut=false;
-    let map:MapLibreMap|null=null;
+    setDegraded('');
+
+    let cancelled=false;
+    const baseGroup=new LayerGroup({layers:[]});
+    let map:OLMap;
 
     try{
-      map=new MapLibreMap({
-        container:node,
-        style:'/map/styles/positron',
-        center:[-58.43,-34.60],
-        zoom:10.7,
-        maxZoom:18,
-        attributionControl:{compact:true},
-        cooperativeGestures:false,
-        renderWorldCopies:false,
+      map=new OLMap({
+        target:node,
+        layers:[baseGroup],
+        view:new View({
+          center:fromLonLat([-58.43,-34.60]),
+          zoom:10.7,
+          minZoom:3,
+          maxZoom:18,
+        }),
+        controls:defaultControls({
+          rotate:false,
+          zoom:true,
+          attribution:true,
+        }),
+        interactions:defaultInteractions({
+          altShiftDragRotate:false,
+          pinchRotate:false,
+        }),
+        pixelRatio:Math.min(window.devicePixelRatio||1,2),
       });
       mapRef.current=map;
     }catch(error:any){
-      const message=String(error?.message||error||'');
-      setFailure(/webgl|gpu/i.test(message)
-        ?'Карта не смогла запуститься в этом WebView. Откройте список или повторите попытку.'
-        :'Не удалось запустить карту. Откройте список или повторите попытку.');
+      setFailure(String(error?.message||'Не удалось запустить карту'));
       return;
     }
 
+    const reveal=()=>{
+      if(cancelled)return;
+      setReady(true);
+      requestAnimationFrame(()=>map.updateSize());
+      window.setTimeout(()=>map.updateSize(),180);
+      window.setTimeout(()=>map.updateSize(),650);
+    };
+
     const timeout=window.setTimeout(()=>{
-      if(!map?.loaded()){
-        timedOut=true;
-        setFailure('Картографический слой не ответил вовремя. Можно повторить или вернуться к списку.');
-      }
-    },12000);
+      if(cancelled)return;
+      setDegraded('Фон карты загружается медленнее обычного. Объекты уже доступны.');
+      reveal();
+    },8000);
 
-    map.once('load',()=>{
-      window.clearTimeout(timeout);
-      if(!timedOut){
-        setReady(true);
-        setFailure('');
-      }
-      requestAnimationFrame(()=>map?.resize());
-      window.setTimeout(()=>map?.resize(),180);
-      window.setTimeout(()=>map?.resize(),700);
-    });
-
-    map.on('error',(event:any)=>{
-      const message=String(event?.error?.message||event?.error||'');
-      if(/webgl|gpu|context lost/i.test(message)){
-        timedOut=true;
+    apply(baseGroup,'/map/styles/positron')
+      .then(()=>{
         window.clearTimeout(timeout);
-        setFailure('Графический режим карты недоступен. Вернитесь к списку или повторите попытку.');
-      }else{
-        console.warn('Map resource error',event?.error||event);
-      }
-    });
+        if(cancelled)return;
+        setDegraded('');
+        reveal();
+      })
+      .catch((error:any)=>{
+        window.clearTimeout(timeout);
+        if(cancelled)return;
+        console.warn('OpenLayers basemap error',error);
+        setDegraded('Не удалось загрузить фон карты. Объекты остаются доступными.');
+        reveal();
+      });
 
-    map.addControl(new NavigationControl({showCompass:false}),'top-right');
-    map.addControl(new GeolocateControl({
-      positionOptions:{enableHighAccuracy:false,timeout:6000},
-      trackUserLocation:false,
-      showAccuracyCircle:false,
-      showUserLocation:true,
-    }),'top-right');
+    const resize=()=>map.updateSize();
+    window.addEventListener('resize',resize,{passive:true});
 
     return ()=>{
+      cancelled=true;
       window.clearTimeout(timeout);
-      markersRef.current.forEach(x=>x.remove());
-      markersRef.current=[];
-      try{map?.remove();}catch{}
+      window.removeEventListener('resize',resize);
+      markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
+      markerOverlaysRef.current=[];
+      if(userOverlayRef.current){
+        map.removeOverlay(userOverlayRef.current);
+        userOverlayRef.current=null;
+      }
+      map.setTarget(undefined);
+      map.dispose();
       mapRef.current=null;
     };
   },[retryKey]);
@@ -135,61 +156,108 @@ export default function CatalogMap({
     const map=mapRef.current;
     if(!map)return;
 
-    const renderMarkers=()=>{
-      markersRef.current.forEach(x=>x.remove());
-      markersRef.current=[];
-      const valid=items.filter(x=>Number.isFinite(Number(x.longitude))&&Number.isFinite(Number(x.latitude)));
-      const groups=new Map<string,MapListing[]>();
-      for(const item of valid){
-        const key=Number(item.longitude).toFixed(5)+','+Number(item.latitude).toFixed(5);
-        const group=groups.get(key)||[];
-        group.push(item);
-        groups.set(key,group);
-      }
+    markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
+    markerOverlaysRef.current=[];
 
-      setSelectedGroup([]);
-      for(const group of groups.values()){
-        const item=group[0];
-        const el=document.createElement('button');
-        el.type='button';
-        el.className=group.length>1?'priceMarker groupMarker':'priceMarker';
-        el.textContent=group.length>1?(group.length+' вариантов'):compactPrice(item);
-        el.setAttribute('aria-label',group.length>1
-          ?(group.length+' объектов · '+(item.address||item.code))
-          :(item.address||item.code));
-        el.onclick=e=>{
-          e.stopPropagation();
-          if(group.length===1)onOpenRef.current(item);
-          else setSelectedGroup(group);
-        };
-        const marker=new Marker({element:el,anchor:'center'})
-          .setLngLat([Number(item.longitude),Number(item.latitude)])
-          .addTo(map);
-        markersRef.current.push(marker);
-      }
+    const valid=items.filter(x=>
+      Number.isFinite(Number(x.longitude))&&Number.isFinite(Number(x.latitude))
+    );
+    const groups=new Map<string,MapListing[]>();
+    for(const item of valid){
+      const key=Number(item.longitude).toFixed(5)+','+Number(item.latitude).toFixed(5);
+      const group=groups.get(key)||[];
+      group.push(item);
+      groups.set(key,group);
+    }
 
-      const focus=focusItems(valid);
-      const bounds=new LngLatBounds();
-      for(const item of focus){
-        bounds.extend([Number(item.longitude),Number(item.latitude)]);
-      }
-      if(focus.length===1){
-        map.flyTo({center:[Number(focus[0].longitude),Number(focus[0].latitude)],zoom:14,duration:300});
-      }else if(focus.length>1&&!bounds.isEmpty()){
-        map.fitBounds(bounds,{padding:{top:112,bottom:158,left:44,right:44},maxZoom:14,duration:360});
-      }
+    setSelectedGroup([]);
+    for(const group of groups.values()){
+      const item=group[0];
+      const el=document.createElement('button');
+      el.type='button';
+      el.className=group.length>1?'priceMarker groupMarker':'priceMarker';
+      el.textContent=group.length>1?(group.length+' вариантов'):compactPrice(item);
+      el.setAttribute('aria-label',group.length>1
+        ?(group.length+' объектов · '+(item.address||item.code))
+        :(item.address||item.code));
+      el.onclick=e=>{
+        e.preventDefault();
+        e.stopPropagation();
+        if(group.length===1)onOpenRef.current(item);
+        else setSelectedGroup(group);
+      };
+      const overlay=new Overlay({
+        element:el,
+        positioning:'center-center',
+        stopEvent:true,
+        position:fromLonLat([Number(item.longitude),Number(item.latitude)]),
+      });
+      map.addOverlay(overlay);
+      markerOverlaysRef.current.push(overlay);
+    }
+
+    const focus=focusItems(valid);
+    if(focus.length===1){
+      map.getView().animate({
+        center:fromLonLat([Number(focus[0].longitude),Number(focus[0].latitude)]),
+        zoom:14,
+        duration:280,
+      });
+    }else if(focus.length>1){
+      const coordinates=focus.map(item=>
+        fromLonLat([Number(item.longitude),Number(item.latitude)])
+      );
+      map.getView().fit(boundingExtent(coordinates),{
+        padding:[112,44,158,44],
+        maxZoom:14,
+        duration:320,
+      });
+    }
+    requestAnimationFrame(()=>map.updateSize());
+
+    return ()=>{
+      markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
+      markerOverlaysRef.current=[];
     };
-
-    if(map.loaded())renderMarkers();
-    else map.once('load',renderMarkers);
-    return ()=>{try{map.off('load',renderMarkers);}catch{}};
   },[items,retryKey]);
 
-  const hasGeo=items.some(x=>Number.isFinite(Number(x.longitude))&&Number.isFinite(Number(x.latitude)));
+  function locate(){
+    const map=mapRef.current;
+    if(!map||!navigator.geolocation||locating)return;
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(position=>{
+      setLocating(false);
+      const coordinate=fromLonLat([position.coords.longitude,position.coords.latitude]);
+      if(userOverlayRef.current)map.removeOverlay(userOverlayRef.current);
+      const el=document.createElement('div');
+      el.className='userLocationDot';
+      const overlay=new Overlay({
+        element:el,
+        positioning:'center-center',
+        stopEvent:false,
+        position:coordinate,
+      });
+      map.addOverlay(overlay);
+      userOverlayRef.current=overlay;
+      map.getView().animate({center:coordinate,zoom:14,duration:350});
+    },()=>{
+      setLocating(false);
+      setDegraded('Не удалось получить геопозицию. Можно продолжать искать по карте.');
+    },{
+      enableHighAccuracy:false,
+      timeout:7000,
+      maximumAge:120000,
+    });
+  }
+
+  const hasGeo=items.some(x=>
+    Number.isFinite(Number(x.longitude))&&Number.isFinite(Number(x.latitude))
+  );
 
   return <div className="mapShell">
     <div ref={containerRef} className="catalogMap"/>
     {!ready&&!failure&&<div className="mapBoot"><div className="spinner"/><span>Загружаем карту…</span></div>}
+
     {!!failure&&<div className="mapFailure">
       <strong>Карта пока недоступна</strong>
       <span>{failure}</span>
@@ -198,7 +266,15 @@ export default function CatalogMap({
         {onFallback&&<button className="mapFallbackBtn" onClick={onFallback}>Показать списком</button>}
       </div>
     </div>}
+
+    {ready&&!!degraded&&<div className="mapDegraded">{degraded}</div>}
+
+    {ready&&<button className="mapLocateBtn" onClick={locate} disabled={locating} aria-label="Моё местоположение">
+      <LocateFixed size={18}/><span>{locating?'Ищем…':'Рядом со мной'}</span>
+    </button>}
+
     {!hasGeo&&<div className="mapEmpty">У выбранных объектов пока нет координат</div>}
+
     {!!selectedGroup.length&&<div className="mapGroupPanel">
       <div className="mapGroupHead">
         <strong>{selectedGroup.length} вариантов по этому адресу</strong>
