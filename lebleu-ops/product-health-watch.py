@@ -266,6 +266,13 @@ def main() -> int:
     if not map_proxy_ok:
         issues.append(f"Mini App map proxy unhealthy: {map_detail[:180]}")
 
+    renderer_rc, renderer_detail = cmd(
+        "python3", "/opt/lebleu-miniapp/scripts/map-renderer-smoke.py"
+    )
+    map_renderer_ok = renderer_rc == 0
+    if not map_renderer_ok:
+        issues.append(f"Mini App map renderer unhealthy: {renderer_detail[:180]}")
+
     current_status = "unhealthy" if issues else "healthy"
     previous_status = previous.get("status")
     previous_issues = previous.get("issues") or []
@@ -305,6 +312,7 @@ def main() -> int:
         "pending_user_delete_count": pending_user_delete_count,
         "stale_interactive_repl_count": len(stale_repls),
         "map_proxy_healthy": map_proxy_ok,
+        "map_renderer_healthy": map_renderer_ok,
         "channel_integrity_healthy": (
             channel_integrity.get("healthy") if isinstance(channel_integrity, dict) and channel_integrity else None
         ),
