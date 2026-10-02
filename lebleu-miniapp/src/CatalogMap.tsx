@@ -112,25 +112,25 @@ export default function CatalogMap({
       window.setTimeout(()=>map.updateSize(),650);
     };
 
-    const timeout=window.setTimeout(()=>{
-      if(cancelled)return;
-      setDegraded('Фон карты загружается медленнее обычного. Объекты уже доступны.');
-      reveal();
-    },8000);
+    // The object layer must never wait for the basemap. Show the Canvas map
+    // immediately, then hydrate the background style in parallel.
+    reveal();
+    const slowStyle=window.setTimeout(()=>{
+      if(!cancelled)setDegraded('Фон карты загружается. Объекты уже доступны.');
+    },1500);
 
     apply(baseGroup,'/map/styles/positron')
       .then(()=>{
-        window.clearTimeout(timeout);
+        window.clearTimeout(slowStyle);
         if(cancelled)return;
         setDegraded('');
-        reveal();
+        requestAnimationFrame(()=>map.updateSize());
       })
       .catch((error:any)=>{
-        window.clearTimeout(timeout);
+        window.clearTimeout(slowStyle);
         if(cancelled)return;
         console.warn('OpenLayers basemap error',error);
-        setDegraded('Не удалось загрузить фон карты. Объекты остаются доступными.');
-        reveal();
+        setDegraded('Фон карты временно недоступен. Объекты остаются доступными.');
       });
 
     const resize=()=>map.updateSize();
@@ -138,7 +138,7 @@ export default function CatalogMap({
 
     return ()=>{
       cancelled=true;
-      window.clearTimeout(timeout);
+      window.clearTimeout(slowStyle);
       window.removeEventListener('resize',resize);
       markerOverlaysRef.current.forEach(x=>map.removeOverlay(x));
       markerOverlaysRef.current=[];
