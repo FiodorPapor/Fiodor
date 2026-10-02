@@ -16,6 +16,7 @@ else
   echo "WARN Telegram WebApp SDK refresh failed; keeping existing local copy" >>"$LOG"
 fi
 npm run build >"$LOG" 2>&1
+python3 scripts/map-renderer-smoke.py
 if ! timeout 120s docker compose build app >>"$LOG" 2>&1; then
   tail -80 "$LOG" >&2
   exit 1
