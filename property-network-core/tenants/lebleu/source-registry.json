@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "sourceId": "lebleu",
+      "sourceSlug": "lebleu",
+      "displayName": "Le Bleu",
+      "ownerTenant": "lebleu",
+      "adapterType": "lebleu_listing",
+      "active": true,
+      "leadRouting": "inventory_owner",
+      "listingTokenStrategy": "legacy_source_url_v1",
+      "legacyDefault": true
+    }
+  ]
+}

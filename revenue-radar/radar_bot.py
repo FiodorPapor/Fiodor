@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import hashlib, json, os, time, urllib.request, urllib.parse, urllib.error, subprocess, re, threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from broad_radar import connect, render_candidate, iso
 from opportunity_state import connect as opp_connect, upsert_person, add_signal, add_or_update_opportunity
@@ -68,8 +70,11 @@ def safe_answer_callback(cqid, text="Принято"):
         return False
 
 def callback_ack_text(data):
+    if data.startswith("inqreply:"): return "Жду текст ответа"
+    if data.startswith("inqtime:"): return "Жду время просмотра"
+    if data.startswith("inqunavail:"): return "Отмечаю объект недоступным"
     if data.startswith("matches:"):
-        return "Ищу совпадения Le Bleu…"
+        return "Ищу подходящие объекты…"
     if data.startswith("catalogreply:"):
         return "Готовлю шаблон каталога…"
     if data.startswith("catalogdraft:"):
@@ -94,6 +99,80 @@ MATCH_CATEGORIES = ("PROPERTY_BUYER", "INVESTOR", "RENTER", "PRE_INTENT")
 CATALOG_REPLY_CATEGORIES = MATCH_CATEGORIES + ("POTENTIAL",)
 LEBLEU_CATALOG_URL = "https://t.me/lebleu_argentina_ru"
 FIODOR_TELEGRAM = "@paporotskiy"
+PROPERTY_INTENT_BASE = os.environ.get("PROPERTY_INTENT_BASE", "http://127.0.0.1:8050").rstrip("/")
+
+def _env_file_value(path, key):
+    try:
+        for line in Path(path).read_text().splitlines():
+            if line.startswith(key+"="):
+                return line.split("=",1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+PROPERTY_INTENT_KEY = os.environ.get("PROPERTY_INTENT_SERVICE_KEY") or _env_file_value("/opt/property-intent-core/.env", "SERVICE_KEY")
+BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+def property_intent(method, path, payload=None, timeout=12):
+    if not PROPERTY_INTENT_KEY:
+        raise RuntimeError("Property Intent service key is not configured")
+    data=json.dumps(payload,ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req=urllib.request.Request(PROPERTY_INTENT_BASE+path,data=data,headers={"Content-Type":"application/json","X-Intent-Key":PROPERTY_INTENT_KEY},method=method)
+    try:
+        with urllib.request.urlopen(req,timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail=exc.read().decode("utf-8","ignore")[:800]
+        raise RuntimeError(f"Property Intent HTTP {exc.code}: {detail}") from exc
+
+def _set_inquiry_pending(con, action, conversation_id):
+    value=json.dumps({"action":action,"conversation_id":conversation_id,"created_at":iso()},ensure_ascii=False)
+    con.execute("INSERT INTO meta(key,value) VALUES('operator_inquiry_pending',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,)); con.commit()
+
+def _get_inquiry_pending(con):
+    row=con.execute("SELECT value FROM meta WHERE key='operator_inquiry_pending'").fetchone()
+    if not row or not row["value"]: return None
+    try:return json.loads(row["value"])
+    except Exception:return None
+
+def _clear_inquiry_pending(con):
+    con.execute("DELETE FROM meta WHERE key='operator_inquiry_pending'"); con.commit()
+
+def _parse_viewing_time(text):
+    raw=" ".join(text.strip().lower().split()); now=datetime.now(BA_TZ)
+    m=re.search(r"(?:завтра\s+)?(\d{1,2})[:.](\d{2})$",raw)
+    if raw.startswith("завтра") and m:
+        dt=(now+timedelta(days=1)).replace(hour=int(m.group(1)),minute=int(m.group(2)),second=0,microsecond=0); return dt
+    m=re.search(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s+(\d{1,2})[:.](\d{2})",raw)
+    if m:
+        year=int(m.group(3)) if m.group(3) else now.year
+        if year<100: year+=2000
+        return datetime(year,int(m.group(2)),int(m.group(1)),int(m.group(4)),int(m.group(5)),tzinfo=BA_TZ)
+    m=re.fullmatch(r"(\d{1,2})[:.](\d{2})",raw)
+    if m:
+        dt=now.replace(hour=int(m.group(1)),minute=int(m.group(2)),second=0,microsecond=0)
+        if dt<=now: dt+=timedelta(days=1)
+        return dt
+    raise ValueError("Формат: 30.10 18:30, завтра 18:30 или 18:30")
+
+def _handle_pending_inquiry_message(con,text):
+    pending=_get_inquiry_pending(con)
+    if not pending:return False
+    cid=str(pending.get("conversation_id") or ""); action=pending.get("action")
+    if not cid:_clear_inquiry_pending(con); return False
+    if text.strip().lower() in {"отмена","cancel","/cancel"}:
+        _clear_inquiry_pending(con); send("Отменено."); return True
+    try:
+        if action=="reply":
+            property_intent("POST",f"/v1/internal/conversations/{cid}/messages",{"body":text.strip(),"source_language":"ru"})
+            _clear_inquiry_pending(con); send("✅ Ответ отправлен клиенту и сохранён в обращении."); return True
+        if action=="time":
+            dt=_parse_viewing_time(text)
+            property_intent("POST",f"/v1/internal/conversations/{cid}/viewings",{"proposed_at":dt.isoformat()})
+            _clear_inquiry_pending(con); send(f"✅ Время предложено: {dt.strftime('%d.%m %H:%M')}. Клиенту отправлено подтверждение."); return True
+    except Exception as exc:
+        send("⚠️ "+str(exc)[:500]+"\n\nМожно повторить или написать «отмена»."); return True
+    return False
 
 # Some communities explicitly prohibit commercial replies, links or service offers.
 # Keep those sources useful for lead discovery, but never create outbound group drafts.
@@ -160,7 +239,7 @@ def response_keyboard(row):
         first.append({"text":"📚 Каталог-шаблон","callback_data":f"catalogreply:{row['id']}"})
     buttons = [first]
     if row["category"] in MATCH_CATEGORIES:
-        buttons.append([{"text":"🏠 Совпадения Le Bleu","callback_data":f"matches:{row['id']}"}])
+        buttons.append([{"text":"🏠 Найти объекты","callback_data":f"matches:{row['id']}"}])
     if row["link"]:
         buttons.append([{"text":"Открыть оригинал","url":row["link"]}])
     return buttons
@@ -272,7 +351,7 @@ def _growth_listing_outreach_link(row, item, surface="dm"):
 def catalog_public_template(row=None):
     catalog_url = _growth_outreach_link(row, "public")
     return (
-        f"Если запрос ещё актуален, вот каталог Le Bleu с текущими объектами: {catalog_url}\n\n"
+        f"Если запрос ещё актуален, вот каталог «Где жить» с текущими объектами: {catalog_url}\n\n"
         f"Если там ничего подходящего нет, напишите мне в личку {FIODOR_TELEGRAM} и коротко опишите, "
         "что ищете. Посмотрю ваш запрос отдельно."
     )
@@ -280,7 +359,7 @@ def catalog_public_template(row=None):
 def catalog_dm_template(row=None):
     catalog_url = _growth_outreach_link(row, "dm")
     return (
-        f"Привет! Увидел ваш запрос. Вот каталог Le Bleu с текущими объектами: {catalog_url}\n\n"
+        f"Привет! Увидел ваш запрос. Вот каталог «Где жить» с текущими объектами: {catalog_url}\n\n"
         "Если там ничего подходящего нет, напишите, что ищете: аренда или покупка, район, бюджет и основные пожелания. "
         "Посмотрю ваш запрос отдельно."
     )
@@ -301,7 +380,7 @@ def send_catalog_reply_kit(row=None):
         if link:
             buttons.append([{"text":"✉️ Открыть личку с текстом","url":link}])
     buttons.append([{"text":"📋 Скопировать для лички","copy_text":{"text":_short(dm,256)}}])
-    buttons.append([{"text":"📚 Открыть каталог Le Bleu","url":LEBLEU_CATALOG_URL}])
+    buttons.append([{"text":"📚 Открыть каталог «Где жить»","url":LEBLEU_CATALOG_URL}])
     if row is not None and row["link"]:
         buttons.append([{"text":"↩️ Открыть исходное сообщение","url":row["link"]}])
     send("📚 Шаблон каталога. Ничего не отправляется автоматически.\n\nВ группу:\n" + public + "\n\nВ личку:\n" + dm, buttons)
@@ -372,7 +451,7 @@ def wait_reply_draft(job_id, seconds=5):
 def ensure_public_card(code):
     item = get_by_code(code)
     if not item:
-        return None, "Объект уже не найден в текущем каталоге Le Bleu."
+        return None, "Объект уже не найден в текущем каталоге."
     existing = public_post_url(item)
     if existing:
         return existing, None
@@ -434,18 +513,18 @@ def send_match_result(candidate, result):
     ]]
     if item.get("sourceUrl"):
         buttons.append([{"text":"🌐 Оригинал Le Bleu","url":item["sourceUrl"]}])
-    send("🏠 Возможный match Le Bleu\n\n" + lebleu_brief(result), buttons)
+    send("🏠 Возможный match\n\n" + lebleu_brief(result), buttons)
 
 def show_candidate_matches(con, row):
     q = parse_query(row["text"], "Alquiler" if row["category"] == "RENTER" else "Venta" if row["category"] in ("PROPERTY_BUYER","INVESTOR") else None)
     if q.get("direct_owner_only"):
-        send("🚫 Le Bleu не предлагаю: в запросе явно указано только напрямую от собственника / без посредников. Сигнал сохранён, но агентский inventory здесь будет плохим контактом.")
+        send("🚫 Агентский объект не предлагаю: в запросе явно указано только напрямую от собственника / без посредников. Сигнал сохранён.")
         return
     matches = match_signal(row["text"], row["category"], 3)
     if not matches:
-        send("Le Bleu: надёжного совпадения по текущему каталогу не нашёл. Лучше не отправлять человеку случайный объект.")
+        send("Надёжного совпадения по текущему каталогу не нашёл. Лучше не отправлять человеку случайный объект.")
         return
-    send(f"Нашёл {len(matches)} совпадени{'е' if len(matches)==1 else 'я'} в текущем каталоге Le Bleu. Это shortlist, не обещание fit:")
+    send(f"Нашёл {len(matches)} совпадени{'е' if len(matches)==1 else 'я'} в текущем каталоге. Это shortlist, не обещание fit:")
     for result in matches:
         time.sleep(1.05)
         send_match_result(row, result)
@@ -453,9 +532,9 @@ def show_candidate_matches(con, row):
 def handle_property_search(text):
     results = lebleu_search(text, limit=5)
     if not results:
-        send("В текущем каталоге Le Bleu подходящего варианта не нашёл. Можно писать свободно, например: «аренда 2 ambientes Palermo до 900 USD с балконом» или «купить 2 ambientes Núñez до 120000 USD». ")
+        send("В текущем каталоге подходящего варианта не нашёл. Можно писать свободно, например: «аренда 2 ambientes Palermo до 900 USD с балконом» или «купить 2 ambientes Núñez до 120000 USD». ")
         return
-    send(f"🏠 Le Bleu: нашёл {len(results)} вариантов по запросу «{_short(text,120)}». Показываю только текущий каталог:")
+    send(f"🏠 Каталог: нашёл {len(results)} вариантов по запросу «{_short(text,120)}». Показываю только текущий каталог:")
     for result in results:
         item = result["item"]
         code = str(item.get("code") or "").strip()
@@ -560,6 +639,62 @@ def send_questions(limit=8):
             buttons.append([{"text":"↩️ Открыть вопрос","url":row["link"]}])
         send(text, buttons)
 
+def _growth_channel_label(source, campaign):
+    labels = {
+        ("telegram_miniapp", "miniapp_catalog"): "Telegram Mini App",
+        ("web_app", "web_catalog"): "Web / установленное приложение",
+        ("telegram_catalog", "live_catalog"): "Telegram-каталог",
+        ("telegram_share", "property_share"): "Расшаренные объекты",
+        ("revenue_radar", "radar_catalog_reply"): "Revenue Radar · каталог",
+        ("revenue_radar", "radar_listing_match"): "Revenue Radar · подходящий объект",
+    }
+    return labels.get((source, campaign)) or " / ".join(x for x in (source, campaign) if x) or "Другой источник"
+
+
+def _human_growth_report(body, days):
+    if not body:
+        return f"📈 Где жить · {days} дн.\n\nНет данных."
+    if "no production events/spend" in body:
+        return f"📈 Где жить · {days} дн.\n\nНовых коммерческих действий и расходов нет."
+    lines = [x for x in body.splitlines() if x.strip()]
+    if len(lines) < 3:
+        return f"📈 Где жить · {days} дн.\n\n" + _short(body, 1200)
+    headers = re.split(r"\s{2,}", lines[0].strip())
+    rows = []
+    for raw in lines[2:]:
+        cells = re.split(r"\s{2,}", raw.strip())
+        if len(cells) != len(headers):
+            continue
+        rows.append(dict(zip(headers, cells)))
+    if not rows:
+        return f"📈 Где жить · {days} дн.\n\n" + _short(body, 1200)
+    def n(row, key):
+        try: return int(float(row.get(key) or 0))
+        except Exception: return 0
+    people = sum(n(r, "people") for r in rows)
+    leads = sum(n(r, "leads") for r in rows)
+    views = sum(n(r, "view") for r in rows)
+    wins = sum(n(r, "wins") for r in rows)
+    out = [
+        f"📈 Где жить · {days} дн.", "",
+        f"👥 Посетили каталог: {people}",
+        f"📩 Целевых обращений: {leads}",
+        f"🏠 Запросов на просмотр: {views}",
+        f"🤝 Сделок: {wins}", "", "По источникам:",
+    ]
+    for row in rows[:8]:
+        parts = [f"посетители: {n(row, 'people')}"]
+        if n(row, "leads"): parts.append(f"обращения: {n(row, 'leads')}")
+        if n(row, "view"): parts.append(f"просмотры: {n(row, 'view')}")
+        if n(row, "wins"): parts.append(f"сделки: {n(row, 'wins')}")
+        if row.get("spend") not in (None, "", "—", "0"):
+            parts.append(f"расходы {row['spend']}")
+        if row.get("CPL") not in (None, "", "—"):
+            parts.append(f"CPL {row['CPL']}")
+        out.append(f"• {_growth_channel_label(row.get('source'), row.get('campaign'))}: " + " · ".join(parts))
+    return "\n".join(out)
+
+
 def growth_text(days=30):
     try:
         days = max(1, min(365, int(days)))
@@ -575,10 +710,10 @@ def growth_text(days=30):
         )
         body = (proc.stdout or proc.stderr or "").strip()
         if proc.returncode != 0:
-            return "📈 Le Bleu Growth\n\nНе удалось получить отчёт: " + _short(body, 800)
-        return f"📈 Le Bleu Growth · {days} дн.\n\n" + (body or "Нет данных.")
+            return "📈 Где жить\n\nНе удалось получить отчёт: " + _short(body, 800)
+        return _human_growth_report(body, days)
     except Exception as exc:
-        return f"📈 Le Bleu Growth\n\nОшибка отчёта: {type(exc).__name__}"
+        return f"📈 Где жить\n\nОшибка отчёта: {type(exc).__name__}"
 
 
 def stats_text(con):
@@ -613,10 +748,11 @@ HELP = """📡 Revenue Radar
 /questions — свежие вопросы по недвижимости для полезных публичных ответов
 /potential — слабые/косвенные сигналы для ручной проверки
 /search текст — поиск среди сигналов Radar
-/find запрос — поиск объектов Le Bleu; можно просто написать запрос обычным текстом
-/catalog — готовый шаблон с каталогом Le Bleu для группы и лички
+/find запрос — поиск объектов; можно просто написать запрос обычным текстом
+/catalog — готовый шаблон каталога «Где жить» для группы и лички
 /stats — состояние радара
-/growth [дни] — измеримая воронка Le Bleu по источникам
+/growth [дни] — воронка «Где жить» по источникам
+/agent — открыть Personal Agent
 
 Кнопки под сигналом фиксируют решение. Просмотренные и шум больше не возвращаются в /new."""
 
@@ -631,6 +767,9 @@ def handle_command(con, text):
     elif cmd == "/growth":
         days = arg if arg.isdigit() else 30
         send(growth_text(days))
+    elif cmd == "/agent":
+        send("🧭 Personal Agent\nРеальный Telegram-поиск, приватные границы и подтверждение перед внешним контактом.",
+             [[{"text":"Открыть Personal Agent","web_app":{"url":"https://personal-agent.srv1636153.hstgr.cloud/"}}]])
     elif cmd == "/new":
         since = (datetime.now(timezone.utc)-timedelta(days=14)).isoformat()
         rows = queue_rows(con, "state='NEW' AND shown_at IS NULL AND region='argentina' AND category IN ('PROPERTY_BUYER','INVESTOR','RENTER','PRE_INTENT','OWNER_DIRECT','OWNER_RENTAL','PARTNER') AND score>=55 AND occurred_at>=?", (since,))
@@ -732,6 +871,23 @@ def handle_callback(con, cq, acknowledged=False):
         if not acknowledged:
             safe_answer_callback(cqid, text)
 
+    if data.startswith("inqreply:") or data.startswith("inqtime:"):
+        try: action,cid=data.split(":",1)
+        except Exception: ack("Некорректная команда"); return
+        try: case=property_intent("GET",f"/v1/internal/conversations/{cid}")
+        except Exception as exc: send("⚠️ Не удалось открыть обращение: "+str(exc)[:400]); return
+        mode="reply" if action=="inqreply" else "time"; _set_inquiry_pending(con,mode,cid)
+        if mode=="reply": send(f"✍️ Ответ клиенту по {case.get('listingAddress') or case.get('listingCode')}\n\nПришли следующим сообщением текст ответа. Чтобы выйти, напиши «отмена».")
+        else: send(f"📅 Предложить время по {case.get('listingAddress') or case.get('listingCode')}\nПредпочтения клиента: {' · '.join(case.get('preferredWindows') or []) or 'не указаны'}\n\nПришли время: 30.10 18:30, завтра 18:30 или просто 18:30. Чтобы выйти, напиши «отмена».")
+        return
+    if data.startswith("inqunavail:"):
+        cid=data.split(":",1)[1]
+        try:
+            property_intent("POST",f"/v1/internal/conversations/{cid}/unavailable",{})
+            send("✅ Объект отмечен недоступным для этого обращения. Клиент получил сообщение и переход к другим вариантам.")
+        except Exception as exc: send("⚠️ Не удалось закрыть обращение: "+str(exc)[:500])
+        return
+
     # Question-lane actions are intentionally separate from commercial lead state.
     if data.startswith(("qdone:", "qskip:", "qlater:")):
         try:
@@ -762,7 +918,7 @@ def handle_callback(con, cq, acknowledged=False):
         try: cid = int(data.split(":",1)[1])
         except Exception: cid = 0
         row = con.execute("SELECT * FROM candidates WHERE id=?", (cid,)).fetchone()
-        ack("Ищу совпадения в Le Bleu…")
+        ack("Ищу подходящие объекты…")
         if row: show_candidate_matches(con, row)
         else: send("Сигнал уже не найден.")
         return
@@ -934,11 +1090,12 @@ def set_commands():
         {"command":"investors","description":"Инвесторы"},
         {"command":"questions","description":"Свежие вопросы по недвижимости"},
         {"command":"potential","description":"Косвенные сигналы"},
-        {"command":"find","description":"Свободный поиск объектов Le Bleu"},
+        {"command":"find","description":"Свободный поиск объектов"},
         {"command":"catalog","description":"Шаблон каталога для группы/лички"},
         {"command":"search","description":"Поиск среди сигналов"},
         {"command":"stats","description":"Статус радара"},
-        {"command":"growth","description":"Воронка Le Bleu по источникам"},
+        {"command":"growth","description":"Воронка «Где жить» по источникам"},
+        {"command":"agent","description":"Открыть Personal Agent"},
         {"command":"help","description":"Команды"}
     ]
     try:
@@ -958,6 +1115,8 @@ def _run_message_job(msg, update_id):
             return
         if text.startswith("/"):
             handle_command(con, text)
+        elif _handle_pending_inquiry_message(con,text):
+            pass
         else:
             handle_property_search(text)
         print(f"BOT_JOB message update={update_id} ok duration={time.monotonic()-started:.2f}s text={_short(text,80)!r}", flush=True)

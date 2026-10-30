@@ -22,6 +22,8 @@ CHANNEL_INTEGRITY = ROOT / "state/channel-integrity.json"
 USER_DELETE_QUEUE = ROOT / "state/telegram-user-delete-queue.json"
 STATE = ROOT / "state/product-health.json"
 ENV = Path("/opt/property-intent-core/.env")
+MINIAPP_ENV = Path("/opt/lebleu-miniapp/.env")
+ALERT_ENV = Path("/opt/intent-radar/radar-alert.env")
 STALE_SECONDS = 3 * 60 * 60
 
 
@@ -38,8 +40,11 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
-def cmd(*parts: str) -> tuple[int, str]:
-    p = subprocess.run(parts, capture_output=True, text=True, timeout=8)
+def cmd(*parts: str, env: dict[str, str] | None = None) -> tuple[int, str]:
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
+    p = subprocess.run(parts, capture_output=True, text=True, timeout=8, env=process_env)
     return p.returncode, (p.stdout or p.stderr or "").strip()
 
 
@@ -178,15 +183,28 @@ def main() -> int:
     ru_stale = 0
     ru_non_russian = 0
     ru_unreviewed = 0
+    ru_missing_examples: list[str] = []
+    ru_stale_examples: list[str] = []
     if isinstance(catalog, list) and isinstance(ru_quality, dict):
         for item in catalog:
+            # No free-text source description means there is nothing to review/translate;
+            # the product intentionally shows current structured facts instead.
+            if not str(item.get("description") or "").strip():
+                continue
             row = ru_quality.get(item.get("sourceUrl")) or {}
             summary = str(row.get("summary_ru") or "").strip()
+            code = str(item.get("code") or item.get("slug") or "без кода")
+            address = str(item.get("address") or "").strip()
+            example = f"{code}{' · ' + address if address else ''}"
             if not summary:
                 ru_missing += 1
+                ru_missing_examples.append(example)
                 continue
-            if row.get("sourceFingerprint") and row.get("sourceFingerprint") != item.get("sourceFingerprint"):
+            reviewed_fp = row.get("ruContentFingerprint") or row.get("sourceFingerprint")
+            current_fp = item.get("ruContentFingerprint") or item.get("sourceFingerprint")
+            if reviewed_fp and reviewed_fp != current_fp:
                 ru_stale += 1
+                ru_stale_examples.append(example)
             if not any("А" <= ch <= "я" or ch in "Ёё" for ch in summary):
                 ru_non_russian += 1
             editor = str(row.get("editor") or "")
@@ -195,10 +213,18 @@ def main() -> int:
     else:
         ru_missing = catalog_count
     if ru_missing or ru_stale or ru_non_russian or ru_unreviewed:
-        issues.append(
-            "русский контент требует внимания: "
-            f"missing={ru_missing}, stale={ru_stale}, non_ru={ru_non_russian}, unreviewed={ru_unreviewed}"
-        )
+        content_issues = []
+        if ru_missing:
+            content_issues.append(f"нет русского описания: {ru_missing}")
+        if ru_stale:
+            content_issues.append(f"описание устарело после изменения объекта: {ru_stale}")
+        if ru_non_russian:
+            content_issues.append(f"описание не на русском: {ru_non_russian}")
+        if ru_unreviewed:
+            content_issues.append(f"нужна проверка перевода: {ru_unreviewed}")
+        examples = (ru_missing_examples + ru_stale_examples)[:4]
+        detail = f". Объекты: {', '.join(examples)}" if examples else ""
+        issues.append("Русский контент: " + "; ".join(content_issues) + detail)
 
     alias_payload = load_json(CATALOG_ALIASES, {})
     aliases = alias_payload.get("aliases", {}) if isinstance(alias_payload, dict) else {}
@@ -255,13 +281,24 @@ def main() -> int:
         if not http_ok(url):
             issues.append(f"{name} недоступен")
 
-    miniapp_ok, miniapp_detail = miniapp_boot_ok(
-        "https://lebleu-app.srv1636153.hstgr.cloud/?health=1"
-    )
+    miniapp_env = read_env(MINIAPP_ENV)
+    public_host = miniapp_env.get("PUBLIC_HOST", "").strip()
+    miniapp_base = f"https://{public_host}" if public_host else ""
+    if not miniapp_base:
+        miniapp_ok, miniapp_detail = False, "PUBLIC_HOST missing from Mini App env"
+    else:
+        miniapp_ok, miniapp_detail = miniapp_boot_ok(f"{miniapp_base}/?health=1")
     if not miniapp_ok:
         issues.append(f"Mini App boot unhealthy: {miniapp_detail}")
 
-    map_rc, map_detail = cmd("python3", "/opt/lebleu-miniapp/scripts/map-proxy-smoke.py")
+    if miniapp_base:
+        map_rc, map_detail = cmd(
+            "python3",
+            "/opt/lebleu-miniapp/scripts/map-proxy-smoke.py",
+            env={"MINIAPP_BASE": miniapp_base},
+        )
+    else:
+        map_rc, map_detail = 1, "Mini App PUBLIC_HOST unavailable"
     map_proxy_ok = map_rc == 0
     if not map_proxy_ok:
         issues.append(f"Mini App map proxy unhealthy: {map_detail[:180]}")
@@ -276,18 +313,21 @@ def main() -> int:
     current_status = "unhealthy" if issues else "healthy"
     previous_status = previous.get("status")
     previous_issues = previous.get("issues") or []
-    env = read_env(ENV)
-    token = env.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = env.get("OPERATOR_CHAT_ID", "")
+    # Operator health alerts belong in the dedicated Revenue Radar bot, never
+    # in the public/user-facing Le Bleu conversation. Keep the Le Bleu env for
+    # product checks, but use only the private operator-alert credentials here.
+    alert_env = read_env(ALERT_ENV)
+    token = alert_env.get("RADAR_ALERT_BOT_TOKEN", "")
+    chat_id = alert_env.get("RADAR_ALERT_CHAT_ID", "")
 
     if issues and (previous_status != "unhealthy" or issues != previous_issues):
-        text = "⚠️ Le Bleu product health\n" + "\n".join(f"• {x}" for x in issues)
+        text = "⚠️ Где жить · качество каталога\nИсточник: Le Bleu\n" + "\n".join(f"• {x}" for x in issues)
         send_telegram(token, chat_id, text)
     elif not issues and previous_status == "unhealthy":
         send_telegram(
             token,
             chat_id,
-            f"✅ Le Bleu product health восстановлен\nКаталог: {catalog_count} объектов.",
+            f"✅ Где жить · качество каталога восстановлено\nИсточник: Le Bleu · объектов: {catalog_count}.",
         )
 
     next_state = {

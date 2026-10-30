@@ -1,0 +1,37 @@
+# Secrets and runtime configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+
+# Runtime data and generated media
+state/
+data/
+public/data/
+public/assets/
+public/maplibre/
+backups/
+*.sqlite*
+*.db
+
+# Dependencies / generated build output
+node_modules/
+dist/
+.next/
+.netlify/
+__pycache__/
+.venv*/
+*.pyc
+*.tsbuildinfo
+
+# Local diagnostics
+*.log
+*.tmp
+.DS_Store
+!services/property-intent/data/
+!services/property-intent/data/reference/
+!services/property-intent/data/reference/**
+apps/miniapp/vite.config.js
+apps/miniapp/vite.config.d.ts

@@ -1,0 +1,17 @@
+{
+  "name": "lebleu-listing-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "sync": "tsx scripts/lebleu-telegram-sync.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,82 @@
+server {
+  listen 80;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  gzip on;
+  gzip_vary on;
+  gzip_min_length 1024;
+  gzip_comp_level 5;
+  gzip_types application/json application/javascript text/css text/plain;
+
+  # Same-origin map proxy. Telegram Android WebView can be unreliable with
+  # third-party style/tile origins; rewrite OpenFreeMap asset URLs back through
+  # this app so the map uses the same HTTPS origin as the Mini App.
+  location ^~ /map/ {
+    # Resolve at request time and force IPv4. The container has no IPv6 route;
+    # allowing AAAA upstreams caused intermittent blank maps in Telegram Android.
+    resolver 127.0.0.11 ipv6=off valid=300s;
+    set $openfreemap_host tiles.openfreemap.org;
+    rewrite ^/map/(.*)$ /$1 break;
+    proxy_pass https://$openfreemap_host;
+    proxy_ssl_server_name on;
+    proxy_ssl_name $openfreemap_host;
+    proxy_set_header Host $openfreemap_host;
+    proxy_set_header Accept-Encoding "";
+    proxy_set_header User-Agent "PropertyNetworkMiniApp/1.0";
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 20s;
+    proxy_send_timeout 20s;
+    proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+    proxy_next_upstream_tries 3;
+    proxy_hide_header Access-Control-Allow-Origin;
+    add_header Access-Control-Allow-Origin "*" always;
+    sub_filter_once off;
+    sub_filter_types application/json text/plain;
+    sub_filter "https://tiles.openfreemap.org/" "/map/";
+  }
+
+  location /api/ {
+    proxy_pass http://${API_UPSTREAM}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location = /manifest.webmanifest {
+    default_type application/manifest+json;
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    try_files $uri =404;
+  }
+
+  location = /sw.js {
+    default_type application/javascript;
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    add_header Service-Worker-Allowed "/" always;
+    try_files $uri =404;
+  }
+
+  location = /index.html {
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    add_header Pragma "no-cache" always;
+    expires -1;
+  }
+
+  location / {
+    add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    try_files $uri $uri/ /index.html;
+  }
+
+  location ~* \.(js|css|png|jpg|jpeg|webp|svg|ico)$ {
+    expires 7d;
+    add_header Cache-Control "public, immutable";
+    try_files $uri =404;
+  }
+
+  add_header X-Content-Type-Options nosniff always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=(self)" always;
+}

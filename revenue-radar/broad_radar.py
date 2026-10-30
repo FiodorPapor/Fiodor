@@ -2,6 +2,7 @@
 import json, os, re, sqlite3, time, urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from lebleu_matcher import match_signal, brief as lebleu_brief, parse_query
 
 RAW_DB = os.getenv("RR_INTELLIGENCE_DB", "/opt/intent-radar/data/intelligence.sqlite3")
 DB_PATH = os.getenv("RR_BROAD_DB", "/opt/intent-radar/data/broad_radar.sqlite3")
@@ -21,7 +22,7 @@ ARG_GEO = (
     "caballito", "villa urquiza", "villa crespo", "almagro", "puerto madero", "san telmo"
 )
 PROPERTY = (
-    "квартир", "жиль", "студи", "апартамент", "недвиж", "дом ", "дом,", "дом.",
+    "квартир", "жиль", "апартамент", "недвиж", "дом ", "дом,", "дом.",
     "departamento", "depto", "dpto", "propiedad", "inmueble", "monoambiente", "ambiente",
     "объект недвиж", "земел", "участ", "terreno", "lote", "local comercial", "oficina", "cochera", "campo"
 )
@@ -37,20 +38,45 @@ BUY = (
     "хочу купить", "хотим купить", "планирую купить", "планируем купить",
     "buy apartment", "buy property"
 )
+BUY_STAGE = (
+    "покупка квартиры", "покупка недвижимости", "приобретение квартиры", "приобретение недвижимости",
+    "покупаю квартиру", "покупаю недвижимость", "куплю квартиру", "куплю недвижимость",
+    "варианты покупки квартиры", "варианты покупки недвижимости", "варианты на покупку",
+    "кто покупал квартиру", "кто покупал недвижимость", "покупал квартиру в аргентине", "покупал недвижимость в аргентине",
+    "смотрю квартиры на продажу", "смотрю недвижимость на продажу", "выбираю квартиру для покупки",
+    "для покупки квартиры", "для покупки недвижимости", "перед покупкой квартиры", "перед покупкой недвижимости",
+    "после покупки квартиры", "после покупки недвижимости", "резерв квартиры", "резерв объекта",
+    "reserva de compra", "seña de compra", "sena de compra", "boleto de compraventa",
+    "compra de departamento", "compra de propiedad", "estoy comprando departamento", "estoy comprando propiedad",
+    "adquisición de propiedad", "adquisicion de propiedad"
+)
 RENT = (
     "снять квартир", "снять жиль", "сниму ", "сниму квартир", "сниму жиль", "сниму дом", "арендовать квартир", "арендовать жиль", "ищу квартир",
     "ищем квартир", "ищу жиль", "ищем жиль", "ищу студ", "ищем студ", "alquilar",
     "alquiler", "busco departamento", "busco depto", "rentar"
 )
 INVEST = (
-    "инвестир", "инвестиц", "инвестицион", "куда влож", "во что влож", "капитал", "доходност", "рентабельност",
-    "сохранить деньги", "сохранить капитал", "rentabilidad", "rendimiento", "invertir",
-    "inversión", "inversion", "investment", "пассивный доход"
+    "хочу инвест", "хотим инвест", "планирую инвест", "куда влож", "во что влож",
+    "разместить капитал", "инвестировать деньги", "инвестировать в", "инвестиции в недвиж",
+    "инвестиционную недвиж", "инвестиционный объект", "доходность недвиж", "рентабельность недвиж",
+    "сохранить капитал", "rentabilidad inmobiliaria", "rentabilidad propiedad",
+    "quiero invertir", "queremos invertir", "invertir en propiedad", "invertir en inmueble",
+    "inversión inmobiliaria", "inversion inmobiliaria", "investment property", "пассивный доход от недвиж"
+)
+INVEST_STAGE = (
+    "сумма инвестиций", "размер инвестиций", "объем инвестиций", "объём инвестиций",
+    "бизнес план", "бизнес-план", "инвестиционная программа", "программа инвестиций",
+    "внж за инвестиции", "внж через инвестиции", "гражданство за инвестиции", "гражданство через инвестиции",
+    "residencia por inversión", "residencia por inversion", "ciudadanía por inversión", "ciudadania por inversion",
+    "monto de inversión", "monto de inversion", "programa de inversión", "programa de inversion",
+    "plan de negocio", "investment program", "investment amount",
+    "открыть бизнес в аргентине", "открыть компанию в аргентине", "бизнес в аргентине"
 )
 PREINTENT = (
     "escritura", "escribano", "boleto de compraventa", "происхождени средств",
     "происхождени денег", "source of funds", "origen de fondos", "swift", "ипотек",
-    "hipoteca", "apto crédito", "apto credito", "комисси", "расходы при покуп",
+    "hipoteca", "apto crédito", "apto credito", "комиссия при покуп", "комиссии при покуп",
+    "комиссия риелтор", "комиссия риэлтор", "расходы при покуп",
     "налог при покуп", "налоги при покуп", "bienes personales", "expensas",
     "перевести деньги", "завести деньги", "перевод денег", "перевод средств",
     "деньги из россии", "деньги в аргентин", "продажа квартиры в россии",
@@ -94,7 +120,8 @@ PROMO = (
     "для новых клиентов", "записаться", "заказать", "стоимость услуги", "наши услуги",
     "оказываем", "оказываю", "наша команда", "написать нам", "оставить заявку",
     "к вашим услугам", "выполняем", "выполняю", "предлагаю", "предлагаем",
-    "помогаю", "поможем", "научу", "консультации", "услуга ", "запись в", "запись:"
+    "помогаю", "поможем", "научу", "консультации", "услуга ", "запись в", "запись:",
+    "индивидуальный подбор", "напишите ваши пожелания", "наша база", "подберем квартиру", "подберём квартиру"
 )
 
 def norm(value):
@@ -103,21 +130,49 @@ def norm(value):
 def has_any(text, cues):
     return any(x in text for x in cues)
 
+PROPERTY_RE = re.compile(
+    r"(?<![\wа-яё])(?:квартир\w*|жиль\w*|апартамент\w*|недвиж\w*|"
+    r"дом(?:а|ом|у|е|ы|ов)?|земел\w*|участ(?:ок|ка|ке|ки|ков|ку|ком)|"
+    r"departamento\w*|depto\w*|dpto\w*|propiedad(?:es)?|inmueble(?:s)?|"
+    r"monoambiente\w*|ambiente(?:s)?|terreno(?:s)?|lote(?:s)?|casa(?:s)?|"
+    r"local comercial|oficina(?:s)?|cochera(?:s)?|campo(?:s)?)(?![\wа-яё])", re.I
+)
+
+def has_property_context(text):
+    return bool(PROPERTY_RE.search(text or ""))
+
 def has_personal_need(text):
     head = (text or "")[:500]
     strong = r"(?:ищу|ищем|хочу|хотим|планирую|планируем|собираюсь|собираемся|busco|necesito|quiero|queremos)"
     if re.search(r"(?<![\wа-яё])" + strong + r"(?![\wа-яё])", head, re.I):
         return True
     weak = r"(?:нужен|нужна|нужно)"
-    if re.search(r"(?<![\wа-яё])" + weak + r"(?![\wа-яё])", head[:220], re.I):
+    weak_target = r"(?:квартир\w*|жиль\w*|дом(?:\s|$)|риелтор\w*|риэлтор\w*|broker\w*|escriban\w*|нотариус\w*|адвокат\w*)"
+    if re.search(r"(?<![\wа-яё])" + weak + r".{0,25}" + weak_target, head[:260], re.I):
         return True
-    return has_any(head[:260], ("подскаж", "посовет", "кто знает", "как лучше", "alguien sabe", "cómo ", "como "))
+    if re.search(r"(?:мне|нам|у меня|у нас).{0,25}" + weak + r".{0,35}" + weak_target, head[:300], re.I):
+        return True
+    # Important: do not use the stem "подскаж" here. It also matches promo
+    # wording such as "подскажу", which previously turned service ads into leads.
+    if re.search(r"(?<![\wа-яё])(?:подскажите|посоветуйте)(?![\wа-яё])", head[:300], re.I):
+        return True
+    if re.search(r"(?<![\wа-яё])кто\s+знает(?![\wа-яё])", head[:300], re.I):
+        return True
+    if re.search(r"(?<![\wа-яё])как\s+лучше(?![\wа-яё])", head[:300], re.I):
+        return True
+    if re.search(r"\b(?:alguien sabe|cómo|como)\b", head[:300], re.I) and ("?" in head or re.search(r"\b(?:comprar|alquilar|invertir)\b", head, re.I)):
+        return True
+    return False
 
 def has_question_intent(text):
     head = (text or "")[:420]
-    return has_any(head, ("подскаж", "посовет", "кто знает", "как лучше", "где снять", "где купить",
-                          "как купить", "как снять", "alguien sabe", "cómo comprar", "como comprar",
-                          "dónde comprar", "donde comprar", "cómo alquilar", "como alquilar"))
+    patterns = (
+        r"\bподскажите\b", r"\bпосоветуйте\b", r"\bкто\s+знает\b", r"\bкак\s+лучше\b",
+        r"\bгде\s+(?:снять|купить)\b", r"\bкак\s+(?:купить|снять)\b",
+        r"\bгде\s+(?:можно\s+)?(?:посмотреть|найти).{0,35}покупк\w*\s+(?:квартир|недвиж)\w*",
+        r"\balguien\s+sabe\b", r"\bc[oó]mo\s+(?:comprar|alquilar)\b", r"\bd[oó]nde\s+comprar\b",
+    )
+    return any(re.search(p, head, re.I) for p in patterns)
 
 def connect():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +208,13 @@ def init_db(con):
       source_key TEXT PRIMARY KEY, last_message_id INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS draft_jobs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id INTEGER, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+      text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+      error TEXT, created_at TEXT NOT NULL, processed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_draft_jobs_status ON draft_jobs(status,id);
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(candidates)")}
     if "region" not in cols:
@@ -186,29 +248,93 @@ def classify(row):
     text = norm(row["text"])
     source = norm(row["chat_title"])
     arg_context = has_any(source, ARG_SOURCE) or has_any(text, ARG_GEO)
-    prop = has_any(text, PROPERTY)
+    prop = has_property_context(text)
+    studio_listing = "студи" in text and (has_any(text, RENT_SUPPLY) or has_any(text, SALE))
+    prop = prop or studio_listing
     need = has_personal_need(text)
     question_intent = has_question_intent(text)
     buy = has_any(text, BUY)
+    buyer_stage = has_any(text, BUY_STAGE) or bool(re.search(r"\bкто(?:-?то)?\s+покупал\w*.{0,45}(?:квартир\w*|недвиж\w*|дом(?:а|ов)?)", text, re.I))
     rent = has_any(text, RENT)
     self_signal = bool(re.search(r"(?:^|\s)(?:я|мы)(?:\s|$)|у меня|у нас|мне |нам |мой |моя |наши |продал|продала|продаем|перевожу|переводим|получил|получила|собираюсь|планирую", text))
-    invest_raw = has_any(text, INVEST)
+    invest_stage = has_any(text, INVEST_STAGE)
+    invest_raw = has_any(text, INVEST) or invest_stage
     crypto_personal = has_any(text, ("usdt", "крипт", "crypto", "binance", "bybit")) and (need or question_intent)
-    pre_raw = has_any(text, PREINTENT) or crypto_personal
+    pre_terms_raw = has_any(text, PREINTENT)
+    # Generic crypto/cash/transfer questions are not property pre-intent by themselves.
+    # Keep them out of buyer funnels unless the same message has real-estate/purchase/investment context.
+    pre_raw = pre_terms_raw and (prop or buy or buyer_stage or invest_raw or has_any(text, (
+        "escritura", "escribano", "boleto de compraventa", "reserva de compra", "informe de dominio",
+        "hipoteca", "apto crédito", "apto credito", "gastos de compra", "comisión inmobiliaria",
+        "comision inmobiliaria", "comprar siendo extranjero", "extranjero comprar"
+    )))
+    if crypto_personal and (buy or buyer_stage or invest_raw):
+        pre_raw = True
     friction = has_any(text, RENT_FRICTION) and (need or question_intent) and (prop or rent)
     relocation = has_any(text, RELOCATION)
     owner = has_any(text, OWNER_DIRECT)
     sale = has_any(text, SALE) and prop
     head = text[:500]
-    explicit_rent_need = bool(re.search(r"(?:ищу|ищем|хочу|хотим|нужна|нужно|сниму|busco|quiero).{0,55}(?:квартир|жиль|студи|дом|departamento|depto|alquilar)", head, re.I))
+    strong_intent_word = r"(?:ищу|ищем|хочу|хотим|сниму|busco|quiero|queremos)"
+    weak_intent_word = r"(?:нужна|нужно|нужен)"
+    residential_noun = r"(?:квартир\w*|жиль\w*|апартамент\w*|departamento\w*|depto\w*|monoambiente\w*)"
+    explicit_rent_need = bool(re.search(strong_intent_word + r".{0,38}" + residential_noun, head, re.I))
+    explicit_rent_need = explicit_rent_need or bool(re.search(weak_intent_word + r".{0,14}" + residential_noun, head, re.I))
+    house_need = bool(re.search(strong_intent_word + r".{0,28}дом(?:\s|$|[,.;])", head, re.I)) and not bool(re.search(r"ищу\s+в\s+дом", head, re.I))
+    house_need = house_need or bool(re.search(weak_intent_word + r".{0,12}дом(?:\s|$|[,.;])", head, re.I))
+    studio_need = bool(re.search(strong_intent_word + r".{0,38}студи\w*", head, re.I)) or bool(re.search(weak_intent_word + r".{0,14}студи\w*", head, re.I))
+    studio_need = studio_need and not has_any(head, ("студию танц", "студия танц", "студию масс", "студия масс", "педагог", "хореограф", "салон красоты", "рабочее место"))
+    rental_question = bool(re.search(r"(?:как|где|площадк\w*).{0,55}(?:снять|арендовать|alquilar).{0,45}" + residential_noun, head, re.I)) or has_any(head, ("как лучше снять жиль", "где снять квартир", "где снять жиль", "арендовать квартиру", "арендовать жилье", "арендовать жильё"))
+    explicit_rent_need = explicit_rent_need or house_need or studio_need or rental_question
+    explicit_rent_word = has_any(text, ("снять", "сниму", "арендовать", "аренда", "долгосроч", "alquiler", "alquilar", "rentar", "por mes"))
+    # “Хочу купить квартиру” must never also become rental demand merely because
+    # “хочу ... квартира” matches the generic residential-need pattern.
+    if (buy or buyer_stage) and not explicit_rent_word:
+        explicit_rent_need = False
+    prop = prop or studio_need
+    rent = rent or explicit_rent_need
     listing_terms = has_any(text, ("/месяц", "в месяц", "usd/месяц", "ars в месяц", "депозит", "expensas", "alquiler temporario"))
     listing_heading = bool(re.search(r"^(?:квартиры? в аренду|аренда в |alquiler |лот#?\d*\s+аренда)", text, re.I))
+    rent_price_listing = bool(re.search(r"(?:аренда|alquiler).{0,60}(?:usd|ars|usdt|\$)\s*[0-9]|(?:аренда|alquiler).{0,60}[0-9][0-9., ]*\s*(?:usd|ars|usdt)", text, re.I))
     promo = has_any(text, PROMO)
-    buyer_demand = buy and (need or question_intent or (self_signal and not promo))
-    rent_supply = (has_any(text, RENT_SUPPLY) and prop) or (listing_heading and prop) or (prop and listing_terms and not explicit_rent_need and not buyer_demand) or (owner and prop and not sale and not buyer_demand and listing_terms)
-    invest = invest_raw and (need or question_intent or (self_signal and not promo))
-    pre = pre_raw and (need or question_intent or (self_signal and not promo)) and not (sale or rent_supply)
+    other_person_question = bool(re.search(r"(?<![\wа-яё])(?:вам|вас|вы)(?![\wа-яё])", head, re.I)) and not (need or self_signal)
+    buyer_active_self = bool(re.search(
+        r"(?:покупаю|покупаем|куплю|купим|хочу купить|хотим купить|планирую купить|планируем купить|"
+        r"собираюсь купить|собираемся купить|ищу.{0,30}(?:для покупки|купить)|ищем.{0,30}(?:для покупки|купить)|"
+        r"смотрю.{0,35}(?:на продажу|для покупки)|смотрим.{0,35}(?:на продажу|для покупки)|"
+        r"выбираю.{0,35}для покупки|потом покупка|следующ(?:ий|ая) этап.{0,35}покупк|"
+        r"estoy comprando|estamos comprando|quiero comprar|queremos comprar|busco.{0,30}para comprar)", text, re.I
+    ))
+    buyer_demand = (buy or buyer_stage) and (need or question_intent or buyer_active_self or (("?" in head) and not promo and not other_person_question))
     partner = has_any(text, PARTNER)
+    agent_rental_need = partner and need and has_any(text, ("аренд", "снять", "alquiler", "alquilar"))
+    explicit_rent_need = explicit_rent_need or agent_rental_need
+    service_listing = listing_heading or (rent_price_listing and has_any(text, ("комиссия", "комиссии", "подбор", "напишите", "контракт")))
+    rent_supply = (has_any(text, RENT_SUPPLY) and prop) or (listing_heading and prop) or (rent_price_listing and prop and not explicit_rent_need) or (owner and prop and not sale and not buyer_demand and listing_terms)
+    if rent_supply and (service_listing or promo) and not bool(re.search(r"^(?:всем привет[!, ]*)?(?:мы |я |ищу|ищем|хочу|хотим|нужна|нужно|сниму)", head, re.I)):
+        explicit_rent_need = False
+    moving_job_noise = has_any(head, ("разовая подработка", "перенести вещи", "перевезти вещи", "грузчик", "помочь с переездом", "оплата каждому"))
+    if moving_job_noise and not has_any(head, ("ищу квартиру", "ищем квартиру", "ищу жиль", "ищем жиль", "хочу снять", "сниму квартиру", "арендовать квартиру")):
+        return None
+    animal_home_noise = has_any(head, ("кот", "кош", "собак", "щен", "питомц", "приют", "мохнат"))
+    if animal_home_noise and not (buy or buyer_stage or explicit_rent_word or sale or rent_supply):
+        return None
+    active_invest_process = bool(re.search(
+        r"(?:мне дали ответ.{0,80}(?:консульств|миграц)|по моему вопросу.{0,80}(?:инвест|бизнес)|"
+        r"готов(?:а|ы)?\s+(?:подать|предоставить|инвестировать)|подаю.{0,40}(?:инвест|бизнес)|"
+        r"хочу попробовать.{0,50}(?:путь|инвест|программ)|готовлю.{0,40}(?:бизнес[- ]?план|документ)|"
+        r"presentar documentos.{0,60}(?:inversi[oó]n|plan de negocio))", text, re.I
+    ))
+    invest = invest_raw and (need or question_intent or active_invest_process)
+    transaction_self = bool(re.search(
+        r"(?:покупаю|купил(?:а)?|приобретаю|оформляю|перевожу деньги|переводим деньги|"
+        r"продал(?:а)? недвиж|продал(?:а)? квартир|моя покупка|наша покупка|"
+        r"estoy comprando|estamos comprando|compré|compre|estoy escriturando)", text, re.I
+    ))
+    pre = pre_raw and (need or question_intent or transaction_self) and not (sale or rent_supply)
+    job_noise = has_any(head, ("ищем педагог", "ищем модератор", "ищем сотрудник", "вакансия", "подработка", "ищем помощник", "ищу заказы", "работа из дома"))
+    if job_noise and not re.search(residential_noun, head, re.I):
+        return None
 
     money_signal = bool(re.search(r"(?:usd|usdt|u\$s|\$|eur|€)\s*\d|\d[\d., ]*\s*(?:usd|usdt|u\$s|eur|€)", text, re.I))
 
@@ -223,12 +349,20 @@ def classify(row):
         score += 8; reasons.append("first-person context")
     if money_signal and (need or question_intent or self_signal):
         score += 8; tags.append("money"); reasons.append("budget/capital amount")
+    # Time-economics: keep low-budget direct-owner rental demand in the database,
+    # but do not let it crowd the operator inbox unless a strong exact fit exists later.
+    direct_only_request = has_any(text, ("без агент", "без риелтор", "без риэлтор", "без посредник", "напрямую от хозя", "напрямую от собственника", "dueño directo", "dueno directo", "sin inmobiliaria"))
+    rental_budget_usd = None
+    m_budget = re.search(r"(?:до|бюджет(?:ом)?(?:\s+до)?)?\s*(?:usd|usdt|u\$s|\$)\s*([0-9]{3,5})|(?:до|бюджет(?:ом)?(?:\s+до)?)?\s*([0-9]{3,5})\s*(?:usd|usdt|доллар)", text, re.I)
+    if m_budget:
+        try: rental_budget_usd = float(m_budget.group(1) or m_budget.group(2))
+        except Exception: rental_budget_usd = None
     if buyer_demand:
-        score += 28; tags.append("buyer"); reasons.append("purchase intent")
-    if rent and (explicit_rent_need or ((need or question_intent) and not rent_supply)):
+        score += 28; tags.append("buyer"); reasons.append("purchase intent" if buy else "purchase-stage intent")
+    if explicit_rent_need:
         score += 25; tags.append("rental_demand"); reasons.append("rental demand")
     if invest:
-        score += 24; tags.append("investor"); reasons.append("capital/investment intent")
+        score += 24; tags.append("investor"); reasons.append("investment-stage intent" if invest_stage else "capital/investment intent")
     if pre:
         score += 18; tags.append("pre_intent"); reasons.append("transaction-readiness topic")
     if friction:
@@ -246,11 +380,15 @@ def classify(row):
     if partner and (need or question_intent or owner or "рекоменд" in text or "контакт" in text):
         score += 12; tags.append("partner"); reasons.append("transaction partner signal")
 
+    if (rent and explicit_rent_need) and direct_only_request and rental_budget_usd is not None and rental_budget_usd <= 600:
+        score -= 24; reasons.append("low-economics direct-owner rental")
+    if relocation and not (prop or invest or pre or friction or buyer_demand or explicit_rent_need):
+        score = min(score, 45); reasons.append("relocation only: low commercial specificity")
     if promo and not owner:
         score -= 30; reasons.append("publisher/service promo")
     if not arg_context and not (buy or invest or pre):
         score -= 20
-    if not (prop or invest or pre or friction or relocation or owner):
+    if not (prop or invest or pre or friction or relocation or owner or (partner and need)):
         return None
     if not tags:
         tags.append("potential")
@@ -327,8 +465,12 @@ def bot_send(text, keyboard=None):
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        return bool(json.load(resp).get("ok"))
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return bool(json.load(resp).get("ok"))
+    except Exception as exc:
+        print(f"Broad alert delivery skipped: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        return False
 
 def render_candidate(con, row):
     who = ("@" + row["sender_username"]) if row["sender_username"] else (row["sender_name"] or row["person_key"])
@@ -356,7 +498,9 @@ def alert_candidate(con, row):
     except Exception:
         occurred = utcnow()
     age = utcnow() - occurred
-    if row["region"] != "argentina" or row["score"] < ALERT_MIN_SCORE or age > timedelta(hours=ALERT_MAX_AGE_HOURS):
+    actionable_push = {"PROPERTY_BUYER","INVESTOR","RENTER","PRE_INTENT","OWNER_DIRECT","OWNER_RENTAL","PARTNER"}
+    if (row["region"] != "argentina" or row["category"] not in actionable_push
+            or row["score"] < ALERT_MIN_SCORE or age > timedelta(hours=ALERT_MAX_AGE_HOURS)):
         return
     keyboard = [[
         {"text":"✅ Лид","callback_data":f"lead:{row['id']}"},
@@ -364,9 +508,45 @@ def alert_candidate(con, row):
         {"text":"🗑 Шум","callback_data":f"noise:{row['id']}"},
         {"text":"⏰ Потом","callback_data":f"later:{row['id']}"}
     ]]
+    demand_categories = ("PROPERTY_BUYER", "INVESTOR", "RENTER", "PRE_INTENT")
+    restricted_outreach = int(row["chat_id"]) == -1001745734197
+    try:
+        latest_draft = con.execute(
+            "SELECT status,error FROM draft_jobs WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (int(row["chat_id"]),)
+        ).fetchone()
+        if latest_draft and latest_draft["status"] == "ERROR":
+            err = latest_draft["error"] or ""
+            restricted_outreach = restricted_outreach or any(
+                marker in err for marker in ("ChatWriteForbiddenError", "ChannelPrivateError", "UserBannedInChannelError")
+            )
+    except Exception:
+        pass
+    reply_row = [{"text":"✍️ Ответить","callback_data":f"reply:{row['id']}"}]
+    if row["category"] in demand_categories and not restricted_outreach:
+        reply_row.append({"text":"📚 Каталог-шаблон","callback_data":f"catalogreply:{row['id']}"})
+    keyboard.append(reply_row)
+    alert_text = render_candidate(con, row)
+    if restricted_outreach:
+        alert_text += "\n\n⚠️ Outreach guard: в этом чате не использовать рекламу, каталог, ссылки или CTA в личку. Только нейтральный полезный ответ после ручной проверки."
+    if row["category"] in demand_categories:
+        keyboard.append([{"text":"🏠 Совпадения Le Bleu","callback_data":f"matches:{row['id']}"}])
+        try:
+            q = parse_query(row["text"], "Alquiler" if row["category"] == "RENTER" else "Venta" if row["category"] in ("PROPERTY_BUYER","INVESTOR") else None)
+            if q.get("direct_owner_only"):
+                alert_text += "\n\n🚫 Le Bleu: не предлагать — человек явно просит напрямую/без посредника."
+            else:
+                lb = match_signal(row["text"], row["category"], 3)
+                if lb:
+                    top = lb[0]
+                    alert_text += f"\n\n🏠 Le Bleu: {len(lb)} возможн. match. Лучший:\n" + lebleu_brief(top)
+                else:
+                    alert_text += "\n\n🏠 Le Bleu: надёжного match сейчас нет."
+        except Exception as exc:
+            print(f"Le Bleu match hint failed: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
     if row["link"]:
         keyboard.append([{"text":"Открыть оригинал","url":row["link"]}])
-    if bot_send(render_candidate(con, row), keyboard):
+    if bot_send(alert_text, keyboard):
         ts = iso()
         con.execute("UPDATE candidates SET alerted_at=?, shown_at=COALESCE(shown_at,?) WHERE id=?", (ts, ts, row["id"]))
         con.commit()
@@ -378,12 +558,18 @@ def process_batch(con, raw, after_id, limit=1000):
     last = after_id
     for row in rows:
         last = row["id"]
-        result = classify(row)
-        if not result:
+        try:
+            result = classify(row)
+            if not result:
+                continue
+            cand = insert_candidate(con, row, result)
+            if cand is not None:
+                alert_candidate(con, cand)
+        except Exception as exc:
+            # Poison-row isolation: one malformed message, DB edge case or alert
+            # failure must not freeze the raw cursor for the rest of the batch.
+            print(f"Broad row {row['id']} skipped: {type(exc).__name__}: {str(exc)[:180]}", flush=True)
             continue
-        cand = insert_candidate(con, row, result)
-        if cand is not None:
-            alert_candidate(con, cand)
     return last, len(rows)
 
 def main():

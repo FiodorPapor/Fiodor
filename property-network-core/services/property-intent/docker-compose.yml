@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ${CONTAINER_PREFIX:-property-intent}-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - property_intent_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [intent]
+
+  api:
+    build: .
+    container_name: ${CONTAINER_PREFIX:-property-intent}-api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount directories, not individual files. The catalog/quality pipeline
+      # updates JSON atomically with rename(); directory mounts make those new
+      # inodes visible inside the container immediately.
+      - ${CATALOG_HOST_PATH:-/opt/agency/catalog}:/data/catalog:ro
+      - ${STATE_HOST_PATH:-/opt/agency/state}:/data/state:ro
+      - ${SOURCE_REGISTRY_HOST_PATH:-/opt/agency/source-registry.json}:/data/source-registry.json:ro
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8050}:8080"
+    networks:
+      - intent
+      - shared
+
+volumes:
+  property_intent_pg:
+
+networks:
+  intent:
+  shared:
+    external: true
+    name: ${SHARED_NETWORK:-n8n_default}

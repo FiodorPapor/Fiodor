@@ -1,0 +1,8 @@
+[Unit]
+Description=Reconcile Property Intent leads into CRM adapters
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/property-intent-core/reconcile.sh
+User=root
