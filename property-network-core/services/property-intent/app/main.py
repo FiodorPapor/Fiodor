@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     rescue_warning_minutes: int = 10
     rescue_escalation_minutes: int = 30
     rescue_required_minutes: int = 60
+    # Lightweight first-party browser workspace for human agents. Business state remains canonical here.
+    agent_inbox_password: str = ""
+    agent_session_hours: int = 12
 
 
 settings = Settings()
@@ -2088,7 +2091,7 @@ def _backfill_listing_provenance() -> None:
 @app.get("/health")
 def health():
     sources = _source_registry()
-    return {"status": "ok", "service": "property-intent-core", "version": "0.1.0", "marketplaceVersion":"20261030-omnichannel-case-os-r7", "marketplaceEnabled":settings.marketplace_enabled, "sourceRegistry": len(sources)}
+    return {"status": "ok", "service": "property-intent-core", "version": "0.1.0", "marketplaceVersion":"20261031-first-party-agent-inbox-r8", "marketplaceEnabled":settings.marketplace_enabled, "sourceRegistry": len(sources)}
 
 
 @app.get("/v1/sources")
@@ -2113,7 +2116,7 @@ def public_config():
         "webAuthEnabled": bool(settings.resend_api_key.strip()),
         "vapidPublicKey": settings.vapid_public_key.strip(),
         "webPushEnabled": bool(settings.vapid_public_key.strip() and settings.vapid_private_key.strip()),
-        "marketplaceVersion": "20261030-omnichannel-case-os-r7",
+        "marketplaceVersion": "20261031-first-party-agent-inbox-r8",
     }
 
 
@@ -3255,6 +3258,9 @@ def startup_marketplace_schema():
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_conversations_assigned_queue ON marketplace_conversations (assigned_queue)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_messages_external_message_id ON marketplace_messages (external_message_id)"))
 
+class AgentLoginIn(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
+
 class EmailAuthStartIn(BaseModel):
     email: str = Field(min_length=5, max_length=254)
     language: str = Field(default="ru", pattern="^(ru|es|en)$")
@@ -3633,7 +3639,7 @@ def _translate_marketplace(text_value: str, source: str, target: str) -> tuple[s
 
 @app.get("/v1/marketplace/status")
 def marketplace_status(session: Session = Depends(db)):
-    return {"ok":True,"enabled":settings.marketplace_enabled,"version":"20261030-omnichannel-case-os-r7","personProfiles":session.query(PersonProfile).filter(PersonProfile.tenant==settings.growth_tenant).count(),"searchProfiles":session.query(SavedSearch).filter(SavedSearch.tenant==settings.growth_tenant,SavedSearch.active.is_(True)).count(),"partners":session.query(PartnerAgency).filter(PartnerAgency.tenant==settings.growth_tenant).count(),"conversations":session.query(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"viewings":session.query(MarketplaceViewing).join(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"agreements":session.query(CollaborationAgreement).filter(CollaborationAgreement.tenant==settings.growth_tenant).count(),"collaborationCases":session.query(CollaborationCase).filter(CollaborationCase.tenant==settings.growth_tenant).count(),"capabilities":["telegram-text-intake","voice-bounded-fallback","person-profile","multiple-search-profiles","saved-search-pause-resume","saved-search-dedupe","significant-price-drop-alerts","web-push-alerts","portable-web-session","bilingual-conversations","translation-provider-fallback","reply-validation","inquiry-workflow","operator-action-queue","viewing-readiness","viewing-supersede","channel-neutral-cases","partner-handoff","sla-rescue","chatwoot-api-projection","listing-lifecycle-filtering","partner-registry","partner-source-linking","supported-url-import-validation","versioned-collaboration-agreements","pii-gate","sale-collaboration","partner-ops-dashboard","pilot-metrics"]}
+    return {"ok":True,"enabled":settings.marketplace_enabled,"version":"20261031-first-party-agent-inbox-r8","personProfiles":session.query(PersonProfile).filter(PersonProfile.tenant==settings.growth_tenant).count(),"searchProfiles":session.query(SavedSearch).filter(SavedSearch.tenant==settings.growth_tenant,SavedSearch.active.is_(True)).count(),"partners":session.query(PartnerAgency).filter(PartnerAgency.tenant==settings.growth_tenant).count(),"conversations":session.query(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"viewings":session.query(MarketplaceViewing).join(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"agreements":session.query(CollaborationAgreement).filter(CollaborationAgreement.tenant==settings.growth_tenant).count(),"collaborationCases":session.query(CollaborationCase).filter(CollaborationCase.tenant==settings.growth_tenant).count(),"capabilities":["telegram-text-intake","voice-bounded-fallback","person-profile","multiple-search-profiles","saved-search-pause-resume","saved-search-dedupe","significant-price-drop-alerts","web-push-alerts","portable-web-session","bilingual-conversations","translation-provider-fallback","reply-validation","inquiry-workflow","operator-action-queue","viewing-readiness","viewing-supersede","channel-neutral-cases","partner-handoff","sla-rescue","first-party-agent-inbox","chatwoot-api-projection","listing-lifecycle-filtering","partner-registry","partner-source-linking","supported-url-import-validation","versioned-collaboration-agreements","pii-gate","sale-collaboration","partner-ops-dashboard","pilot-metrics"]}
 
 @app.post("/v1/telegram/webhook")
 def telegram_marketplace_webhook(update: dict[str, Any], x_telegram_bot_api_secret_token: str | None = Header(default=None), session: Session = Depends(db)):
@@ -4006,6 +4012,59 @@ def client_viewing_action(viewing_id: UUID, action: str, init_data: str = Query(
     else: conv.workflow_status="new"; conv.next_action_type="reschedule_viewing"; conv.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); _operator_inquiry_notification(session,conv,message="Клиент отклонил предложенное время. Нужно согласовать другое.")
     conv.updated_at=now; conv.last_client_activity_at=now; _marketplace_metric(session,f"viewing_{desired}",actor_id=person.telegram_user_id,object_id=row.id); session.commit(); return {"ok":True,"status":row.status,"duplicate":False,"workflowStatus":conv.workflow_status}
 
+_AGENT_SESSION_COOKIE = "pn_agent_session"
+_agent_login_attempts: dict[str, list[datetime]] = {}
+
+def _agent_inbox_enabled() -> bool:
+    return bool(settings.agent_inbox_password.strip())
+
+def _agent_session_secret() -> bytes:
+    material=f"{settings.service_key}:{settings.agent_inbox_password}".encode()
+    return hashlib.sha256(material).digest()
+
+def _issue_agent_session() -> str:
+    expires=int((datetime.now(UTC)+timedelta(hours=max(1,settings.agent_session_hours))).timestamp())
+    payload=str(expires)
+    sig=hmac.new(_agent_session_secret(),payload.encode(),hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+def _agent_session_valid(raw: str) -> bool:
+    if not raw or not _agent_inbox_enabled(): return False
+    try:
+        expiry_s,sig=raw.split(".",1); expiry=int(expiry_s)
+    except Exception: return False
+    if expiry<=int(datetime.now(UTC).timestamp()): return False
+    expected=hmac.new(_agent_session_secret(),expiry_s.encode(),hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected,sig)
+
+def _require_agent(request: Request) -> None:
+    if not _agent_session_valid(request.cookies.get(_AGENT_SESSION_COOKIE,"")):
+        raise HTTPException(status_code=401,detail="Agent session required")
+
+def _agent_rate_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+@app.get("/v1/agent/session")
+def agent_session_state(request: Request):
+    return {"enabled":_agent_inbox_enabled(),"authenticated":_agent_session_valid(request.cookies.get(_AGENT_SESSION_COOKIE,""))}
+
+@app.post("/v1/agent/session")
+def agent_session_login(body: AgentLoginIn, request: Request, response: Response):
+    if not _agent_inbox_enabled(): raise HTTPException(status_code=503,detail="Agent inbox is not configured")
+    now=datetime.now(UTC); key=_agent_rate_key(request); cutoff=now-timedelta(minutes=15)
+    recent=[x for x in _agent_login_attempts.get(key,[]) if x>cutoff]; _agent_login_attempts[key]=recent
+    if len(recent)>=8: raise HTTPException(status_code=429,detail="Too many login attempts")
+    if not hmac.compare_digest(body.password,settings.agent_inbox_password):
+        recent.append(now); _agent_login_attempts[key]=recent; raise HTTPException(status_code=401,detail="Неверный код доступа")
+    _agent_login_attempts.pop(key,None); token=_issue_agent_session(); max_age=max(3600,settings.agent_session_hours*3600)
+    response.set_cookie(_AGENT_SESSION_COOKIE,token,max_age=max_age,httponly=True,secure=True,samesite="strict",path="/")
+    return {"ok":True,"authenticated":True}
+
+@app.delete("/v1/agent/session")
+def agent_session_logout(response: Response):
+    response.delete_cookie(_AGENT_SESSION_COOKIE,path="/")
+    return {"ok":True}
+
 @app.get("/v1/internal/conversations")
 def internal_conversations(queue: str = Query(default="needs_action"), x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
     _marketplace_service_auth(x_intent_key); now=datetime.now(UTC); query=select(MarketplaceConversation).where(MarketplaceConversation.tenant==settings.growth_tenant,MarketplaceConversation.status=="open")
@@ -4037,6 +4096,53 @@ def mark_conversation_unavailable(conversation_id: UUID, x_intent_key: str | Non
     _marketplace_metric(session,"listing_unavailable_after_inquiry",object_id=conv.id); session.commit(); person=session.get(PersonProfile,conv.person_profile_id)
     if person and person.telegram_user_id and person.telegram_user_id>0: _bot_send(person.telegram_user_id,"Этот объект больше недоступен. Откройте каталог — подберём похожие варианты.",reply_markup={"inline_keyboard":[[{"text":"Показать другие варианты","web_app":{"url":settings.miniapp_url}}]]})
     return {"ok":True,"status":"unavailable","duplicate":False}
+
+@app.get("/v1/agent/cases")
+def agent_cases(request: Request, queue: str = Query(default="needs_action"), session: Session = Depends(db)):
+    _require_agent(request); now=datetime.now(UTC)
+    query=select(MarketplaceConversation).where(MarketplaceConversation.tenant==settings.growth_tenant,MarketplaceConversation.status=="open")
+    if queue=="overdue": query=query.where(MarketplaceConversation.next_action_due_at.is_not(None),MarketplaceConversation.next_action_due_at<now)
+    elif queue=="rescue": query=query.where(MarketplaceConversation.escalation_level>=2)
+    elif queue=="waiting_partner": query=query.where(MarketplaceConversation.workflow_status=="waiting_partner")
+    elif queue=="waiting_client": query=query.where(MarketplaceConversation.workflow_status=="waiting_client")
+    elif queue=="scheduled": query=query.where(MarketplaceConversation.workflow_status=="scheduled")
+    elif queue=="new": query=query.where(MarketplaceConversation.workflow_status=="new")
+    else: query=query.where(MarketplaceConversation.next_action_type.is_not(None),MarketplaceConversation.workflow_status.not_in(["waiting_client","scheduled"]))
+    rows=list(session.scalars(query.order_by(MarketplaceConversation.next_action_due_at.asc().nullslast(),MarketplaceConversation.updated_at.desc()).limit(80)))
+    items=[]
+    for row in rows:
+        listing=_conversation_listing(row) or {}; person=session.get(PersonProfile,row.person_profile_id)
+        latest=session.scalar(select(MarketplaceMessage).where(MarketplaceMessage.conversation_id==row.id).order_by(MarketplaceMessage.created_at.desc()).limit(1))
+        items.append({"id":str(row.id),"listingCode":row.listing_code,"listingAddress":listing.get("address") or listing.get("code") or row.listing_code,"workflowStatus":row.workflow_status,"primaryIntent":row.primary_intent,"nextActionType":row.next_action_type,"nextActionDueAt":row.next_action_due_at.isoformat() if row.next_action_due_at else None,"overdue":bool(row.next_action_due_at and row.next_action_due_at<now),"assignedActorType":row.assigned_actor_type,"assignedActorId":row.assigned_actor_id,"assignedQueue":row.assigned_queue,"sourceChannel":row.source_channel,"escalationLevel":row.escalation_level,"rescueReason":row.rescue_reason,"updatedAt":row.updated_at.isoformat(),"client":{"name":person.display_name if person else None,"username":person.username if person else None},"lastMessage":(latest.translated_body or latest.body) if latest else "","qualificationSnapshot":row.qualification_snapshot_json or {}})
+    return {"items":items,"queue":queue,"count":len(items)}
+
+@app.get("/v1/agent/cases/{conversation_id}")
+def agent_case(conversation_id: UUID, request: Request, session: Session = Depends(db)):
+    _require_agent(request)
+    detail=internal_conversation(conversation_id,settings.service_key,session)
+    messages=list(session.scalars(select(MarketplaceMessage).where(MarketplaceMessage.conversation_id==conversation_id).order_by(MarketplaceMessage.created_at.asc())))
+    requests=list(session.scalars(select(MarketplaceViewingRequest).where(MarketplaceViewingRequest.conversation_id==conversation_id).order_by(MarketplaceViewingRequest.created_at.asc())))
+    viewings=list(session.scalars(select(MarketplaceViewing).where(MarketplaceViewing.conversation_id==conversation_id).order_by(MarketplaceViewing.created_at.asc())))
+    detail["messages"]=[{"id":str(m.id),"senderRole":m.sender_role,"sourceLanguage":m.source_language,"body":m.body,"translatedBody":m.translated_body,"translationStatus":m.translation_status,"deliveryStatus":m.delivery_status,"sourceChannel":m.source_channel,"createdAt":m.created_at.isoformat()} for m in messages]
+    detail["viewingRequests"]=[{"id":str(v.id),"preferredWindows":v.preferred_windows_json or [],"note":v.note,"status":v.status,"createdAt":v.created_at.isoformat()} for v in requests]
+    detail["viewings"]=[{"id":str(v.id),"proposedAt":v.proposed_at.isoformat(),"status":v.status,"createdAt":v.created_at.isoformat()} for v in viewings]
+    detail["listingUrl"]=f"{settings.miniapp_url}/?listing={detail['listingCode']}"
+    return detail
+
+@app.post("/v1/agent/cases/{conversation_id}/messages")
+def agent_case_message(conversation_id: UUID, body: MessageIn, request: Request, session: Session = Depends(db)):
+    _require_agent(request)
+    return partner_message(conversation_id,body,settings.service_key,session)
+
+@app.post("/v1/agent/cases/{conversation_id}/viewings")
+def agent_case_viewing(conversation_id: UUID, body: ViewingIn, request: Request, session: Session = Depends(db)):
+    _require_agent(request)
+    return propose_viewing(conversation_id,body,settings.service_key,session)
+
+@app.post("/v1/agent/cases/{conversation_id}/unavailable")
+def agent_case_unavailable(conversation_id: UUID, request: Request, session: Session = Depends(db)):
+    _require_agent(request)
+    return mark_conversation_unavailable(conversation_id,settings.service_key,session)
 
 @app.post("/v1/internal/conversations/rescue-sweep")
 def rescue_sweep(x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):

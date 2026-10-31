@@ -6,6 +6,12 @@ RUNTIME_ROOT="${PROPERTY_INTENT_RUNTIME_ROOT:-/opt/property-intent-core}"
 ENV_FILE="${PROPERTY_INTENT_ENV_FILE:-$RUNTIME_ROOT/.env}"
 COMPOSE_PROJECT="${PROPERTY_INTENT_COMPOSE_PROJECT:-property-intent-core}"
 export PROPERTY_INTENT_ENV_FILE="$ENV_FILE"
+AGENT_INBOX_SECRET_FILE="${AGENT_INBOX_SECRET_FILE:-/root/.agent-inbox-access}"
+if [[ -r "$AGENT_INBOX_SECRET_FILE" ]]; then
+  export AGENT_INBOX_PASSWORD="$(tr -d '\r\n' < "$AGENT_INBOX_SECRET_FILE")"
+else
+  export AGENT_INBOX_PASSWORD=""
+fi
 
 LOG=/tmp/property-intent-deploy.$$.log
 cleanup(){
