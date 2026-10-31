@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_ROOT="${MINIAPP_RUNTIME_ROOT:-/opt/lebleu-miniapp}"
+
+# Canonical Git source and the historical live Compose root are intentionally separate.
+# Sync only build/runtime inputs. Never overwrite runtime .env, node_modules or deploy history.
+if [[ "$(realpath "$SOURCE_ROOT")" != "$(realpath "$RUNTIME_ROOT")" ]]; then
+  test -r "$RUNTIME_ROOT/.env" || { echo "Runtime env not readable: $RUNTIME_ROOT/.env" >&2; exit 1; }
+  mkdir -p "$RUNTIME_ROOT/src" "$RUNTIME_ROOT/scripts" "$RUNTIME_ROOT/nginx" "$RUNTIME_ROOT/public"
+  rsync -a --delete "$SOURCE_ROOT/src/" "$RUNTIME_ROOT/src/"
+  rsync -a --delete "$SOURCE_ROOT/scripts/" "$RUNTIME_ROOT/scripts/"
+  rsync -a --delete "$SOURCE_ROOT/nginx/" "$RUNTIME_ROOT/nginx/"
+  rsync -a "$SOURCE_ROOT/public/" "$RUNTIME_ROOT/public/"
+  for file in Dockerfile docker-compose.yml index.html package.json package-lock.json tsconfig.app.json tsconfig.json tsconfig.node.json vite.config.ts; do
+    [[ -f "$SOURCE_ROOT/$file" ]] && install -m 0644 "$SOURCE_ROOT/$file" "$RUNTIME_ROOT/$file"
+  done
+  install -m 0755 "$SOURCE_ROOT/deploy.sh" "$RUNTIME_ROOT/deploy.sh"
+  exec env MINIAPP_RUNTIME_ROOT="$RUNTIME_ROOT" "$RUNTIME_ROOT/deploy.sh"
+fi
+
+ROOT="$SOURCE_ROOT"
 cd "$ROOT"
 LOG=/tmp/property-network-miniapp-deploy.$$.log
 env_value() {
@@ -16,7 +36,14 @@ export PROPERTY_INTENT_ENV="$(env_value PROPERTY_INTENT_ENV /opt/property-intent
 export BRAND_LOGO_TARGET="$ROOT/public/brand-logo.jpg"
 export RELEASE_VERSION_PATH="$ROOT/release-version.txt"
 export MINIAPP_BASE="$PUBLIC_BASE"
-cleanup(){ rm -f "$LOG"; }
+cleanup(){
+  local rc=$?
+  if (( rc != 0 )) && [[ -s "$LOG" ]]; then
+    echo "miniapp deploy failed; last log lines:" >&2
+    tail -120 "$LOG" >&2 || true
+  fi
+  rm -f "$LOG"
+}
 trap cleanup EXIT
 if ! timeout 20s python3 scripts/fetch-brand-logo.py >>"$LOG" 2>&1; then
   echo "WARN brand logo refresh failed; keeping existing asset" >>"$LOG"

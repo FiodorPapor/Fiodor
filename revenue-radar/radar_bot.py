@@ -878,7 +878,7 @@ def handle_callback(con, cq, acknowledged=False):
         except Exception as exc: send("⚠️ Не удалось открыть обращение: "+str(exc)[:400]); return
         mode="reply" if action=="inqreply" else "time"; _set_inquiry_pending(con,mode,cid)
         if mode=="reply": send(f"✍️ Ответ клиенту по {case.get('listingAddress') or case.get('listingCode')}\n\nПришли следующим сообщением текст ответа. Чтобы выйти, напиши «отмена».")
-        else: send(f"📅 Предложить время по {case.get('listingAddress') or case.get('listingCode')}\nПредпочтения клиента: {' · '.join(case.get('preferredWindows') or []) or 'не указаны'}\n\nПришли время: 30.10 18:30, завтра 18:30 или просто 18:30. Чтобы выйти, напиши «отмена».")
+        else: send(f"📅 Предложить время по {case.get('listingAddress') or case.get('listingCode')}\n\nПришли конкретное время, которое реально можно предложить клиенту: 30.10 18:30, завтра 18:30 или просто 18:30. Чтобы выйти, напиши «отмена».")
         return
     if data.startswith("inqunavail:"):
         cid=data.split(":",1)[1]
@@ -1155,6 +1155,28 @@ def _store_offset(con, offset):
     )
     con.commit()
 
+def _sweep_case_rescue():
+    try:
+        result=property_intent("POST","/v1/internal/conversations/rescue-sweep",{})
+        urgent=[x for x in (result.get("changed") or []) if int(x.get("level") or 0)>=2]
+        if not urgent:
+            return
+        lines=["🚨 <b>Где жить · нужны действия</b>"]
+        for row in urgent[:6]:
+            try:
+                case=property_intent("GET",f"/v1/internal/conversations/{row['id']}")
+                address=case.get("listingAddress") or case.get("listingCode") or "Объект"
+                queue=case.get("assignedQueue") or case.get("assignedActorId") or "central_rescue"
+                reason="партнёр не ответил" if row.get("reason")=="partner_non_response" else "просрочен следующий шаг"
+                lines.append(f"• {address} · {reason} · очередь: {queue}")
+            except Exception:
+                lines.append("• Обращение переведено в rescue-очередь")
+        if len(urgent)>6:
+            lines.append(f"Ещё: {len(urgent)-6}")
+        send("\n".join(lines))
+    except Exception as exc:
+        print(f"CASE_RESCUE sweep failed: {type(exc).__name__}: {str(exc)[:220]}", flush=True)
+
 def main():
     con = connect()
     set_commands()
@@ -1162,8 +1184,12 @@ def main():
         (con.execute("SELECT value FROM meta WHERE key='bot_update_offset'").fetchone() or {"value":"0"})["value"]
     )
     print(f"Revenue Radar bot online · offset={offset} · workers={BOT_WORKERS}", flush=True)
+    last_case_sweep=0.0
     while True:
         try:
+            now_mono=time.monotonic()
+            if now_mono-last_case_sweep>=60:
+                _sweep_case_rescue(); last_case_sweep=now_mono
             result = api("getUpdates", {
                 "offset": offset,
                 "timeout": 25,

@@ -20,7 +20,7 @@ services:
     build: .
     container_name: ${CONTAINER_PREFIX:-property-intent}-api
     restart: unless-stopped
-    env_file: .env
+    env_file: ${PROPERTY_INTENT_ENV_FILE:-/opt/property-intent-core/.env}
     depends_on:
       db:
         condition: service_healthy

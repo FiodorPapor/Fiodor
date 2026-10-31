@@ -17,7 +17,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -81,6 +81,18 @@ class Settings(BaseSettings):
     test_telegram_ids: str = ""
     # Staff/operator accounts use the real product without becoming leads or polluting acquisition KPIs.
     internal_telegram_ids: str = ""
+    # Optional human-workspace projection. Disabled until a separate Chatwoot host exists.
+    chatwoot_enabled: bool = False
+    chatwoot_base_url: str = ""
+    chatwoot_account_id: int = 0
+    chatwoot_api_inbox_id: int = 0
+    chatwoot_api_token: str = ""
+    chatwoot_webhook_secret: str = ""
+    chatwoot_webhook_max_age_seconds: int = 300
+    partner_handoff_ttl_minutes: int = 120
+    rescue_warning_minutes: int = 10
+    rescue_escalation_minutes: int = 30
+    rescue_required_minutes: int = 60
 
 
 settings = Settings()
@@ -2076,7 +2088,7 @@ def _backfill_listing_provenance() -> None:
 @app.get("/health")
 def health():
     sources = _source_registry()
-    return {"status": "ok", "service": "property-intent-core", "version": "0.1.0", "marketplaceVersion":"20261030-inquiry-orchestration-r6", "marketplaceEnabled":settings.marketplace_enabled, "sourceRegistry": len(sources)}
+    return {"status": "ok", "service": "property-intent-core", "version": "0.1.0", "marketplaceVersion":"20261030-omnichannel-case-os-r7", "marketplaceEnabled":settings.marketplace_enabled, "sourceRegistry": len(sources)}
 
 
 @app.get("/v1/sources")
@@ -2101,7 +2113,7 @@ def public_config():
         "webAuthEnabled": bool(settings.resend_api_key.strip()),
         "vapidPublicKey": settings.vapid_public_key.strip(),
         "webPushEnabled": bool(settings.vapid_public_key.strip() and settings.vapid_private_key.strip()),
-        "marketplaceVersion": "20261030-inquiry-orchestration-r6",
+        "marketplaceVersion": "20261030-omnichannel-case-os-r7",
     }
 
 
@@ -3021,6 +3033,23 @@ class PartnerAgency(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
+class ListingResponsibility(Base):
+    __tablename__ = "listing_responsibilities"
+    __table_args__ = (UniqueConstraint("tenant","inventory_source_id","listing_key",name="uq_listing_responsibility"),)
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant: Mapped[str] = mapped_column(String(64), index=True)
+    inventory_source_id: Mapped[str] = mapped_column(String(64), index=True)
+    listing_key: Mapped[str] = mapped_column(String(120), default="*", index=True)
+    operation: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(24))
+    actor_id: Mapped[str] = mapped_column(String(128))
+    fallback_actor_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    fallback_actor_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
 class MarketplaceConversation(Base):
     __tablename__ = "marketplace_conversations"
     id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -3043,6 +3072,12 @@ class MarketplaceConversation(Base):
     last_operator_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_channel: Mapped[str] = mapped_column(String(24), default="legacy", index=True)
+    preferred_outbound_channel: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    assigned_queue: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    routing_decision_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    escalation_level: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    rescue_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     client_last_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -3059,6 +3094,9 @@ class MarketplaceMessage(Base):
     translation_status: Mapped[str] = mapped_column(String(24), default="not_needed")
     translation_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     delivery_status: Mapped[str | None] = mapped_column(String(24), nullable=True, default="stored")
+    source_channel: Mapped[str] = mapped_column(String(24), default="legacy", index=True)
+    external_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    external_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     reply_to_message_id: Mapped[UUID | None] = mapped_column(PgUUID(as_uuid=True), ForeignKey("marketplace_messages.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
@@ -3071,6 +3109,65 @@ class MarketplaceViewingRequest(Base):
     status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+class PartnerHandoff(Base):
+    __tablename__ = "partner_handoffs"
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant: Mapped[str] = mapped_column(String(64), index=True)
+    conversation_id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), ForeignKey("marketplace_conversations.id", ondelete="CASCADE"), index=True)
+    partner_agency_id: Mapped[UUID | None] = mapped_column(PgUUID(as_uuid=True), ForeignKey("partner_agencies.id", ondelete="SET NULL"), nullable=True, index=True)
+    transport: Mapped[str] = mapped_column(String(24), default="manual")
+    recipient_ref: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    sanitized_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    claim_token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+class CommunicationProjection(Base):
+    __tablename__ = "communication_projections"
+    __table_args__ = (UniqueConstraint("provider","conversation_id",name="uq_communication_projection_case"),)
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    conversation_id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), ForeignKey("marketplace_conversations.id", ondelete="CASCADE"), index=True)
+    external_contact_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    external_conversation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    external_inbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+class CommunicationOutbox(Base):
+    __tablename__ = "communication_outbox"
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    kind: Mapped[str] = mapped_column(String(48), index=True)
+    conversation_id: Mapped[UUID | None] = mapped_column(PgUUID(as_uuid=True), ForeignKey("marketplace_conversations.id", ondelete="CASCADE"), nullable=True, index=True)
+    message_id: Mapped[UUID | None] = mapped_column(PgUUID(as_uuid=True), ForeignKey("marketplace_messages.id", ondelete="CASCADE"), nullable=True, index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    external_delivery_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+class IntegrationDelivery(Base):
+    __tablename__ = "integration_deliveries"
+    __table_args__ = (UniqueConstraint("provider","delivery_id",name="uq_integration_delivery"),)
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    delivery_id: Mapped[str] = mapped_column(String(128))
+    event_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 class MarketplaceViewing(Base):
     __tablename__ = "marketplace_viewings"
@@ -3144,8 +3241,19 @@ def startup_marketplace_schema():
         conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS last_operator_activity_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS close_reason VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS source_channel VARCHAR(24) DEFAULT 'legacy'"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS preferred_outbound_channel VARCHAR(24)"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS assigned_queue VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS routing_decision_json JSON DEFAULT '{}'::json"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS escalation_level INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE marketplace_conversations ADD COLUMN IF NOT EXISTS rescue_reason VARCHAR(128)"))
+        conn.execute(text("ALTER TABLE marketplace_messages ADD COLUMN IF NOT EXISTS source_channel VARCHAR(24) DEFAULT 'legacy'"))
+        conn.execute(text("ALTER TABLE marketplace_messages ADD COLUMN IF NOT EXISTS external_provider VARCHAR(32)"))
+        conn.execute(text("ALTER TABLE marketplace_messages ADD COLUMN IF NOT EXISTS external_message_id VARCHAR(128)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_conversations_workflow_status ON marketplace_conversations (workflow_status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_conversations_next_action_due_at ON marketplace_conversations (next_action_due_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_conversations_assigned_queue ON marketplace_conversations (assigned_queue)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_marketplace_messages_external_message_id ON marketplace_messages (external_message_id)"))
 
 class EmailAuthStartIn(BaseModel):
     email: str = Field(min_length=5, max_length=254)
@@ -3171,11 +3279,13 @@ class ConversationIn(BaseModel):
     message: str = Field(default="", max_length=4000)
     viewing_windows: list[str] = Field(default_factory=list, max_length=6)
     source_language: str = Field(default="ru", pattern="^(ru|es|en)$")
+    source_channel: str = Field(default="web", pattern="^(web|telegram|whatsapp|email)$")
 
 class ClientMessageIn(BaseModel):
     init_data: str = ""
     body: str = Field(min_length=1, max_length=4000)
     source_language: str = Field(default="ru", pattern="^(ru|es|en)$")
+    source_channel: str = Field(default="web", pattern="^(web|telegram|whatsapp|email)$")
     reply_to_message_id: UUID | None = None
 
 class ProfileIn(BaseModel):
@@ -3225,16 +3335,84 @@ class CollaborationOutcomeIn(BaseModel):
     outcome: str = Field(pattern="^(offer|reserved|closed_won|closed_lost)$")
     note: str | None = Field(default=None, max_length=1000)
 
+class PartnerHandoffIn(BaseModel):
+    conversation_id: UUID
+    partner_agency_id: UUID | None = None
+    transport: str = Field(default="manual", pattern="^(manual|whatsapp|email|api)$")
+    recipient_ref: str | None = Field(default=None, max_length=320)
+
+class PartnerHandoffClaimIn(BaseModel):
+    token: str = Field(min_length=24, max_length=256)
+    claimant: str = Field(min_length=2, max_length=255)
+    accept: bool = True
+
+class ListingResponsibilityIn(BaseModel):
+    inventory_source_id: str = Field(min_length=1, max_length=64)
+    listing_key: str = Field(default="*", min_length=1, max_length=120)
+    operation: str | None = Field(default=None, pattern="^(Alquiler|Venta)$")
+    actor_type: str = Field(pattern="^(internal_agent|team|partner_agent|partner_team|owner|queue)$")
+    actor_id: str = Field(min_length=1, max_length=128)
+    fallback_actor_type: str | None = Field(default=None, max_length=24)
+    fallback_actor_id: str | None = Field(default=None, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
 _CABA_HOODS = ["Agronomía","Almagro","Balvanera","Barracas","Belgrano","Boedo","Caballito","Chacarita","Coghlan","Colegiales","Constitución","Flores","Floresta","La Boca","La Paternal","Liniers","Mataderos","Monte Castro","Monserrat","Nueva Pompeya","Núñez","Palermo","Parque Avellaneda","Parque Chacabuco","Parque Chas","Parque Patricios","Puerto Madero","Recoleta","Retiro","Saavedra","San Cristóbal","San Nicolás","San Telmo","Vélez Sarsfield","Versalles","Villa Crespo","Villa del Parque","Villa Devoto","Villa General Mitre","Villa Lugano","Villa Luro","Villa Ortúzar","Villa Pueyrredón","Villa Real","Villa Riachuelo","Villa Santa Rita","Villa Soldati","Villa Urquiza"]
 
 def _marketplace_service_auth(key: str | None) -> None:
     if not key or not hmac.compare_digest(key, settings.service_key):
         raise HTTPException(status_code=401, detail="Invalid intent key")
 
-def _safe_qualification_snapshot(facts: dict[str, Any] | None) -> dict[str, Any]:
+def _safe_qualification_snapshot(facts: dict[str, Any] | None, *, operation: str | None = None, search: SavedSearch | None = None) -> dict[str, Any]:
     facts=facts or {}
-    allowed=("occupants","pets","guarantee","moveIn","termMonths","incomeType")
-    return {k:facts[k] for k in allowed if facts.get(k) not in (None,"")}
+    allowed=("occupants","pets","guarantee","moveIn","termMonths","incomeType","purchaseTiming","financingType")
+    snapshot={k:facts[k] for k in allowed if k in facts and facts.get(k) not in (None,"")}
+    criteria=(search.criteria_json or {}) if search else {}
+    for src,dst in (("moveIn","moveIn"),("termMonths","termMonths"),("purchaseTiming","purchaseTiming")):
+        if dst not in snapshot and criteria.get(src) not in (None,""): snapshot[dst]=criteria[src]
+    if operation: snapshot["operation"]=operation
+    return snapshot
+
+def _readiness_for(person: PersonProfile, item: dict[str, Any], search: SavedSearch | None = None) -> dict[str, Any]:
+    operation=str(item.get("operation") or "")
+    facts=person.facts_json or {}
+    if operation=="Alquiler":
+        required=("occupants","pets","incomeType","guarantee")
+    elif operation=="Venta":
+        required=("purchaseTiming","financingType")
+    else:
+        required=()
+    missing=[key for key in required if key not in facts or facts.get(key) in (None,"")]
+    snapshot=_safe_qualification_snapshot(facts,operation=operation,search=search)
+    return {"operation":operation,"ready":not missing,"state":"ready" if not missing else "incomplete","missing":missing,"snapshot":snapshot,"warnings":[],"verification":facts.get("verification") if isinstance(facts.get("verification"),dict) else {}}
+
+def _effective_channel(mode: str, requested: str | None = None) -> str:
+    if mode=="telegram": return "telegram"
+    return requested if requested in {"web","email","whatsapp"} else "web"
+
+def _preferred_channel(person: PersonProfile, source_channel: str) -> str:
+    preferred=str((person.facts_json or {}).get("preferredChannel") or "")
+    return preferred if preferred in {"web","telegram","email","whatsapp"} else source_channel
+
+def _resolve_case_assignment(session: Session, item: dict[str, Any], partner: PartnerAgency | None = None) -> dict[str, Any]:
+    source_id=str(item.get("sourceId") or item.get("inventorySourceId") or "")
+    listing_key=str(item.get("listingToken") or item.get("code") or "")
+    operation=str(item.get("operation") or "")
+    responsibility=None
+    if source_id:
+        responsibility=session.scalar(select(ListingResponsibility).where(ListingResponsibility.tenant==settings.growth_tenant,ListingResponsibility.inventory_source_id==source_id,ListingResponsibility.listing_key==listing_key,ListingResponsibility.active.is_(True)))
+        if responsibility is None:
+            responsibility=session.scalar(select(ListingResponsibility).where(ListingResponsibility.tenant==settings.growth_tenant,ListingResponsibility.inventory_source_id==source_id,ListingResponsibility.listing_key=="*",ListingResponsibility.active.is_(True)))
+    if operation=="Venta":
+        return {"actorType":"queue","actorId":"lebleu_sales","queue":"lebleu_sales","reason":"buyer_origin_protected","listingResponsibilityId":str(responsibility.id) if responsibility else None}
+    if responsibility:
+        return {"actorType":responsibility.actor_type,"actorId":responsibility.actor_id,"queue":responsibility.actor_id if responsibility.actor_type in {"team","queue","partner_team"} else None,"reason":"listing_responsibility","responsibilityId":str(responsibility.id)}
+    if partner:
+        return {"actorType":"partner_agency","actorId":str(partner.id),"queue":f"partner:{partner.id}","reason":"verified_partner_inventory"}
+    return {"actorType":"queue","actorId":"lebleu_rental" if operation=="Alquiler" else "central_operator","queue":"lebleu_rental" if operation=="Alquiler" else "central_operator","reason":"operation_fallback"}
+
+def _queue_communication_projection(session: Session, conversation_id: UUID, kind: str, *, message_id: UUID | None = None, payload: dict[str, Any] | None = None) -> None:
+    if not settings.chatwoot_enabled: return
+    session.add(CommunicationOutbox(provider="chatwoot",kind=kind,conversation_id=conversation_id,message_id=message_id,payload_json=payload or {},status="pending",next_attempt_at=datetime.now(UTC)))
 
 def _workflow_label(status: str | None) -> str:
     return {
@@ -3257,18 +3435,16 @@ def _operator_inquiry_notification(session: Session, row: MarketplaceConversatio
     person=session.get(PersonProfile,row.person_profile_id)
     facts=(person.facts_json or {}) if person else {}
     who=(f"@{person.username}" if person and person.username else (person.display_name if person and person.display_name else "Клиент"))
-    requests=list(session.scalars(select(MarketplaceViewingRequest).where(MarketplaceViewingRequest.conversation_id==row.id,MarketplaceViewingRequest.status=="pending").order_by(MarketplaceViewingRequest.created_at.desc()).limit(1)))
-    windows=(requests[0].preferred_windows_json if requests else []) or []
     qualification=row.qualification_snapshot_json or {}
     lines=[f"🔥 <b>Где жить · {'запрос на просмотр' if row.primary_intent=='viewing' else 'новое обращение'}</b>",html.escape(str(item.get('address') or item.get('code') or row.listing_code)),f"Клиент: <b>{html.escape(str(who))}</b>"]
     contact=" · ".join(str(x) for x in (facts.get("phone"),facts.get("email")) if x)
     if contact: lines.append("Контакт: "+html.escape(contact))
-    if windows: lines.append("Когда удобно: "+html.escape(" · ".join(str(x) for x in windows)))
+    if row.primary_intent=="viewing": lines.append("Готовность: <b>✓ данные для запроса собраны</b>")
     if qualification:
         labels={"occupants":"Жильцы","pets":"Питомцы","guarantee":"Гарантия","moveIn":"Въезд","termMonths":"Срок","incomeType":"Доход"}
         lines.append("Контекст: "+html.escape(" · ".join(f"{labels.get(k,k)}: {v}" for k,v in qualification.items())))
     source=item.get("sourceDisplayName") or item.get("sourceName") or item.get("sourceId") or row.inventory_source_id or row.inventory_owner_tenant or "—"
-    lines.extend([f"Inventory: {html.escape(str(source))}",f"Статус: <b>{html.escape(_workflow_label(row.workflow_status))}</b>"])
+    lines.extend([f"Inventory: {html.escape(str(source))}",f"Ответственный: <b>{html.escape(str(row.assigned_actor_id or row.assigned_queue or 'central_operator'))}</b>",f"Статус: <b>{html.escape(_workflow_label(row.workflow_status))}</b>"])
     if message: lines.extend(["",html.escape(message[:1200])])
     keyboard={"inline_keyboard":[
         [{"text":"✍️ Ответить","callback_data":f"inqreply:{row.id}"},{"text":"📅 Предложить время","callback_data":f"inqtime:{row.id}"}],
@@ -3457,7 +3633,7 @@ def _translate_marketplace(text_value: str, source: str, target: str) -> tuple[s
 
 @app.get("/v1/marketplace/status")
 def marketplace_status(session: Session = Depends(db)):
-    return {"ok":True,"enabled":settings.marketplace_enabled,"version":"20261030-inquiry-orchestration-r6","personProfiles":session.query(PersonProfile).filter(PersonProfile.tenant==settings.growth_tenant).count(),"searchProfiles":session.query(SavedSearch).filter(SavedSearch.tenant==settings.growth_tenant,SavedSearch.active.is_(True)).count(),"partners":session.query(PartnerAgency).filter(PartnerAgency.tenant==settings.growth_tenant).count(),"conversations":session.query(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"viewings":session.query(MarketplaceViewing).join(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"agreements":session.query(CollaborationAgreement).filter(CollaborationAgreement.tenant==settings.growth_tenant).count(),"collaborationCases":session.query(CollaborationCase).filter(CollaborationCase.tenant==settings.growth_tenant).count(),"capabilities":["telegram-text-intake","voice-bounded-fallback","person-profile","multiple-search-profiles","saved-search-pause-resume","saved-search-dedupe","significant-price-drop-alerts","web-push-alerts","portable-web-session","bilingual-conversations","translation-provider-fallback","reply-validation","inquiry-workflow","operator-action-queue","viewing-request-preferences","viewing-supersede","listing-lifecycle-filtering","partner-registry","partner-source-linking","supported-url-import-validation","versioned-collaboration-agreements","pii-gate","sale-collaboration","partner-ops-dashboard","pilot-metrics"]}
+    return {"ok":True,"enabled":settings.marketplace_enabled,"version":"20261030-omnichannel-case-os-r7","personProfiles":session.query(PersonProfile).filter(PersonProfile.tenant==settings.growth_tenant).count(),"searchProfiles":session.query(SavedSearch).filter(SavedSearch.tenant==settings.growth_tenant,SavedSearch.active.is_(True)).count(),"partners":session.query(PartnerAgency).filter(PartnerAgency.tenant==settings.growth_tenant).count(),"conversations":session.query(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"viewings":session.query(MarketplaceViewing).join(MarketplaceConversation).filter(MarketplaceConversation.tenant==settings.growth_tenant).count(),"agreements":session.query(CollaborationAgreement).filter(CollaborationAgreement.tenant==settings.growth_tenant).count(),"collaborationCases":session.query(CollaborationCase).filter(CollaborationCase.tenant==settings.growth_tenant).count(),"capabilities":["telegram-text-intake","voice-bounded-fallback","person-profile","multiple-search-profiles","saved-search-pause-resume","saved-search-dedupe","significant-price-drop-alerts","web-push-alerts","portable-web-session","bilingual-conversations","translation-provider-fallback","reply-validation","inquiry-workflow","operator-action-queue","viewing-readiness","viewing-supersede","channel-neutral-cases","partner-handoff","sla-rescue","chatwoot-api-projection","listing-lifecycle-filtering","partner-registry","partner-source-linking","supported-url-import-validation","versioned-collaboration-agreements","pii-gate","sale-collaboration","partner-ops-dashboard","pilot-metrics"]}
 
 @app.post("/v1/telegram/webhook")
 def telegram_marketplace_webhook(update: dict[str, Any], x_telegram_bot_api_secret_token: str | None = Header(default=None), session: Session = Depends(db)):
@@ -3683,6 +3859,20 @@ def save_profile(body: ProfileIn, session: Session = Depends(db)):
     person.preferred_language=body.preferred_language; person.facts_json={**(person.facts_json or {}),**body.facts}; person.display_name=str(body.facts.get("name") or person.display_name or "")[:255] or person.display_name; person.updated_at=datetime.now(UTC); session.commit()
     return {"id":str(person.id),"displayName":person.display_name,"preferredLanguage":person.preferred_language,"facts":person.facts_json or {},"authMode":mode,"telegramLinked":person.telegram_user_id is not None}
 
+@app.get("/v1/readiness")
+def get_readiness(listing_code: str = Query(...), search_id: UUID | None = Query(default=None), init_data: str = Query(default=""), session_token: str = Header(default="",alias="X-Session-Token"), session: Session = Depends(db)):
+    person,user,mode=_person_from_auth(session,init_data,session_token,True)
+    if not person: raise HTTPException(status_code=401,detail="Войдите, чтобы запросить просмотр")
+    item=_listing_by_key(listing_code)
+    if not item: raise HTTPException(status_code=404,detail="Listing not found")
+    search=None
+    if search_id:
+        search=session.get(SavedSearch,search_id)
+        if not search or search.tenant!=settings.growth_tenant or search.person_profile_id!=person.id: raise HTTPException(status_code=404,detail="Search profile not found")
+    result=_readiness_for(person,item,search)
+    result["profileId"]=str(person.id); result["authMode"]=mode
+    return result
+
 @app.get("/v1/conversations")
 def list_conversations(init_data: str = Query(default=""), session_token: str = Header(default="",alias="X-Session-Token"), session: Session = Depends(db)):
     person,user,mode=_person_from_auth(session,init_data,session_token,True)
@@ -3704,46 +3894,56 @@ def create_conversation(body: ConversationIn, session_token: str = Header(defaul
     if not person: raise HTTPException(status_code=401,detail="Войдите, чтобы отправить запрос")
     actor_id=int(user["id"]) if user else None
     if body.intent=="question" and not body.message.strip(): raise HTTPException(status_code=422,detail="Напишите вопрос")
-    windows=[str(x).strip()[:120] for x in body.viewing_windows if str(x).strip()]
-    if body.intent=="viewing" and not windows: raise HTTPException(status_code=422,detail="Выберите удобное время")
+    search=None
     if body.search_id:
         search=session.get(SavedSearch,body.search_id)
         if not search or search.tenant!=settings.growth_tenant or search.person_profile_id!=person.id: raise HTTPException(status_code=404,detail="Search profile not found")
     if not item: raise HTTPException(status_code=404,detail="Listing not found")
     if str(item.get("status") or "active").lower() in {"paused","unavailable","reserved","rented","sold","removed"}: raise HTTPException(status_code=409,detail="Объект больше недоступен")
-    prov=_routing_context(item); partner=None
-    if prov.get("routingMode")=="collaboration_required":
+    readiness=_readiness_for(person,item,search)
+    if body.intent=="viewing" and not readiness["ready"]:
+        raise HTTPException(status_code=422,detail={"code":"PROFILE_INCOMPLETE","message":"Заполните недостающие данные профиля","missing":readiness["missing"]})
+    prov=_routing_context(item); operation=str(item.get("operation") or ""); partner=None
+    # Rental can route to a verified inventory partner. A platform-origin buyer stays buyer-side first.
+    if operation!="Venta" and prov.get("routingMode")=="collaboration_required":
         partner=next((p for p in session.scalars(select(PartnerAgency).where(PartnerAgency.tenant==settings.growth_tenant,PartnerAgency.status=="active")) if bool((p.metadata_json or {}).get("verified")) and prov.get("inventorySourceId") in ((p.metadata_json or {}).get("sourceIds") or []) and str((p.metadata_json or {}).get("ownerTenant") or "")==prov.get("inventoryOwnerTenant")),None)
-    listing_key=item.get("listingToken") or item.get("code") or body.listing_code; now=datetime.now(UTC)
+    assignment=_resolve_case_assignment(session,item,partner)
+    source_channel=_effective_channel(mode,body.source_channel); listing_key=item.get("listingToken") or item.get("code") or body.listing_code; now=datetime.now(UTC)
     row=session.scalar(select(MarketplaceConversation).where(MarketplaceConversation.tenant==settings.growth_tenant,MarketplaceConversation.person_profile_id==person.id,MarketplaceConversation.listing_code==listing_key,MarketplaceConversation.status=="open").order_by(MarketplaceConversation.created_at.desc()).limit(1))
+    created=row is None
     if row is None:
-        row=MarketplaceConversation(tenant=settings.growth_tenant,person_profile_id=person.id,search_id=body.search_id,listing_code=listing_key,inventory_source_id=prov.get("inventorySourceId"),inventory_owner_tenant=prov.get("inventoryOwnerTenant"),partner_agency_id=partner.id if partner else None,qualification_snapshot_json=_safe_qualification_snapshot(person.facts_json),primary_intent=body.intent,workflow_status="new"); session.add(row); session.flush()
-    elif body.intent=="viewing": row.primary_intent="viewing"
+        row=MarketplaceConversation(tenant=settings.growth_tenant,person_profile_id=person.id,search_id=body.search_id,listing_code=listing_key,inventory_source_id=prov.get("inventorySourceId"),inventory_owner_tenant=prov.get("inventoryOwnerTenant"),partner_agency_id=partner.id if partner else None,qualification_snapshot_json=readiness["snapshot"] if body.intent=="viewing" else {},primary_intent=body.intent,workflow_status="new",source_channel=source_channel,preferred_outbound_channel=_preferred_channel(person,source_channel)); session.add(row); session.flush()
+    elif body.intent=="viewing":
+        row.primary_intent="viewing"; row.qualification_snapshot_json=readiness["snapshot"]
+    row.assigned_actor_type=assignment["actorType"]; row.assigned_actor_id=assignment["actorId"]; row.assigned_queue=assignment.get("queue"); row.routing_decision_json={**assignment,"inventoryOwner":prov.get("inventoryOwnerTenant"),"inventorySourceId":prov.get("inventorySourceId"),"operation":operation}; row.source_channel=row.source_channel or source_channel; row.preferred_outbound_channel=row.preferred_outbound_channel or _preferred_channel(person,source_channel)
     row.workflow_status="waiting_partner" if partner else "new"; row.next_action_type="contact_partner" if partner else ("check_availability" if body.intent=="viewing" else "reply_client"); row.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); row.last_client_activity_at=now; row.updated_at=now
     person.preferred_language=body.source_language; person.updated_at=now
-    viewing_prefix={"ru":"Хочу посмотреть объект. Удобно: ","es":"Quiero visitar la propiedad. Me queda bien: ","en":"I would like to view the property. Preferred time: "}.get(body.source_language,"Хочу посмотреть объект. Удобно: ")
-    client_text=body.message.strip() if body.message.strip() else (viewing_prefix+" · ".join(windows))
-    translated,translation_status,provider=_translate_marketplace(client_text,body.source_language,"es"); session.add(MarketplaceMessage(conversation_id=row.id,sender_role="client",source_language=body.source_language,body=client_text,translated_body=translated,translation_status=translation_status,translation_provider=provider,delivery_status="partner_routed" if partner else "operator_queue"))
-    if body.intent=="viewing": session.add(MarketplaceViewingRequest(conversation_id=row.id,preferred_windows_json=windows,note=body.message.strip() or None,status="pending"))
-    _marketplace_metric(session,"viewing_requested" if body.intent=="viewing" else "conversation_message",actor_id=actor_id,object_id=row.id,properties={"routingMode":prov.get("routingMode"),"inventoryOwner":prov.get("inventoryOwnerTenant"),"authMode":mode}); session.commit()
-    if prov.get("routingMode")=="collaboration_required" and not partner: _marketplace_metric(session,"partner_route_missing",object_id=row.id,properties={"inventoryOwner":prov.get("inventoryOwnerTenant"),"sourceId":prov.get("inventorySourceId")}); session.commit()
+    translation_status="not_needed"
+    if body.intent=="question":
+        client_text=body.message.strip(); translated,translation_status,provider=_translate_marketplace(client_text,body.source_language,"es"); msg=MarketplaceMessage(conversation_id=row.id,sender_role="client",source_language=body.source_language,body=client_text,translated_body=translated,translation_status=translation_status,translation_provider=provider,delivery_status="partner_routed" if partner else "operator_queue",source_channel=source_channel); session.add(msg); session.flush(); _queue_communication_projection(session,row.id,"message_created",message_id=msg.id)
+    else:
+        windows=[str(x).strip()[:120] for x in body.viewing_windows if str(x).strip()]
+        session.add(MarketplaceViewingRequest(conversation_id=row.id,preferred_windows_json=windows,note=body.message.strip() or None,status="pending"))
+    _queue_communication_projection(session,row.id,"case_created" if created else "case_updated")
+    _marketplace_metric(session,"viewing_requested" if body.intent=="viewing" else "conversation_message",actor_id=actor_id,object_id=row.id,properties={"routingMode":prov.get("routingMode"),"inventoryOwner":prov.get("inventoryOwnerTenant"),"authMode":mode,"sourceChannel":source_channel,"assignmentReason":assignment["reason"]}); session.commit()
+    if operation!="Venta" and prov.get("routingMode")=="collaboration_required" and not partner: _marketplace_metric(session,"partner_route_missing",object_id=row.id,properties={"inventoryOwner":prov.get("inventoryOwnerTenant"),"sourceId":prov.get("inventorySourceId")}); session.commit()
     _operator_inquiry_notification(session,row)
-    if person.telegram_user_id and person.telegram_user_id>0:
+    if person.telegram_user_id and person.telegram_user_id>0 and row.preferred_outbound_channel=="telegram":
         if body.source_language=="es":
-            ack=("✅ <b>Solicitud de visita enviada</b>\n"+html.escape("Preferencia: "+" · ".join(windows))+"\n\nEstamos verificando la propiedad y coordinando un horario concreto. La respuesta llegará aquí." if body.intent=="viewing" else "✅ <b>Consulta enviada</b>\nLa respuesta llegará aquí.")
+            ack=("✅ <b>Solicitud de visita enviada</b>\n\nEl agente verificará la propiedad y propondrá un horario concreto. La respuesta quedará en «Mis consultas»." if body.intent=="viewing" else "✅ <b>Consulta enviada</b>\nLa respuesta quedará en «Mis consultas».")
         elif body.source_language=="en":
-            ack=("✅ <b>Viewing request sent</b>\n"+html.escape("Preferred: "+" · ".join(windows))+"\n\nWe are checking the property and coordinating a specific time. The reply will arrive here." if body.intent=="viewing" else "✅ <b>Question sent</b>\nThe reply will arrive here.")
+            ack=("✅ <b>Viewing request sent</b>\n\nThe agent will verify the property and propose a specific time. The reply will be saved in “My inquiries”." if body.intent=="viewing" else "✅ <b>Question sent</b>\nThe reply will be saved in “My inquiries”.")
         else:
-            ack=("✅ <b>Запрос на просмотр отправлен</b>\n"+html.escape("Предпочтительно: "+" · ".join(windows))+"\n\nСейчас проверяем объект и согласовываем конкретное время. Ответ придёт здесь и сохранится в «Моих обращениях»." if body.intent=="viewing" else "✅ <b>Вопрос отправлен</b>\nОтвет придёт здесь и сохранится в «Моих обращениях».")
+            ack=("✅ <b>Запрос на просмотр отправлен</b>\n\nАгент проверит объект и предложит конкретное время. Ответ сохранится в «Моих обращениях»." if body.intent=="viewing" else "✅ <b>Вопрос отправлен</b>\nОтвет сохранится в «Моих обращениях».")
         _bot_send(person.telegram_user_id,ack)
-    return {"ok":True,"id":str(row.id),"translationStatus":translation_status,"routingMode":prov.get("routingMode"),"inventoryOwner":prov.get("inventoryOwnerTenant"),"partnerLinked":partner is not None,"deliveryState":"partner_routed" if partner else "operator_queue","workflowStatus":row.workflow_status}
+    return {"ok":True,"id":str(row.id),"translationStatus":translation_status,"routingMode":prov.get("routingMode"),"inventoryOwner":prov.get("inventoryOwnerTenant"),"partnerLinked":partner is not None,"deliveryState":"partner_routed" if partner else "operator_queue","workflowStatus":row.workflow_status,"assignment":assignment}
 
 @app.get("/v1/conversations/{conversation_id}")
 def get_conversation(conversation_id: UUID, init_data: str = Query(default=""), session_token: str = Header(default="",alias="X-Session-Token"), session: Session = Depends(db)):
     person,user,mode=_person_from_auth(session,init_data,session_token,True); row=session.get(MarketplaceConversation,conversation_id)
     if not person or not row or row.tenant!=settings.growth_tenant or row.person_profile_id!=person.id: raise HTTPException(status_code=404,detail="Conversation not found")
     item=_conversation_listing(row) or {}; msgs=list(session.scalars(select(MarketplaceMessage).where(MarketplaceMessage.conversation_id==row.id).order_by(MarketplaceMessage.created_at.asc()))); views=list(session.scalars(select(MarketplaceViewing).where(MarketplaceViewing.conversation_id==row.id).order_by(MarketplaceViewing.created_at.asc()))); requests=list(session.scalars(select(MarketplaceViewingRequest).where(MarketplaceViewingRequest.conversation_id==row.id).order_by(MarketplaceViewingRequest.created_at.asc()))); row.client_last_read_at=datetime.now(UTC); session.commit()
-    return {"id":str(row.id),"status":row.status,"workflowStatus":row.workflow_status,"workflowLabel":_workflow_label(row.workflow_status),"primaryIntent":row.primary_intent,"nextActionType":row.next_action_type,"nextActionDueAt":row.next_action_due_at.isoformat() if row.next_action_due_at else None,"listingCode":row.listing_code,"listingAddress":item.get("address") or item.get("code") or row.listing_code,"qualificationSnapshot":row.qualification_snapshot_json or {},"messages":[{"id":str(m.id),"senderRole":m.sender_role,"body":m.body,"translatedBody":m.translated_body,"translationStatus":m.translation_status,"deliveryStatus":m.delivery_status,"replyToMessageId":str(m.reply_to_message_id) if m.reply_to_message_id else None,"createdAt":m.created_at.isoformat()} for m in msgs],"viewingRequests":[{"id":str(v.id),"preferredWindows":v.preferred_windows_json or [],"note":v.note,"status":v.status,"createdAt":v.created_at.isoformat()} for v in requests],"viewings":[{"id":str(v.id),"proposedAt":v.proposed_at.isoformat(),"status":v.status} for v in views]}
+    return {"id":str(row.id),"status":row.status,"workflowStatus":row.workflow_status,"workflowLabel":_workflow_label(row.workflow_status),"primaryIntent":row.primary_intent,"nextActionType":row.next_action_type,"nextActionDueAt":row.next_action_due_at.isoformat() if row.next_action_due_at else None,"listingCode":row.listing_code,"listingAddress":item.get("address") or item.get("code") or row.listing_code,"qualificationSnapshot":row.qualification_snapshot_json or {},"messages":[{"id":str(m.id),"senderRole":m.sender_role,"body":m.body,"translatedBody":m.translated_body,"translationStatus":m.translation_status,"deliveryStatus":m.delivery_status,"sourceChannel":m.source_channel,"replyToMessageId":str(m.reply_to_message_id) if m.reply_to_message_id else None,"createdAt":m.created_at.isoformat()} for m in msgs],"viewingRequests":[{"id":str(v.id),"preferredWindows":v.preferred_windows_json or [],"note":v.note,"status":v.status,"createdAt":v.created_at.isoformat()} for v in requests],"viewings":[{"id":str(v.id),"proposedAt":v.proposed_at.isoformat(),"status":v.status} for v in views]}
 
 @app.post("/v1/conversations/{conversation_id}/messages")
 def client_message(conversation_id: UUID, body: ClientMessageIn, session_token: str = Header(default="",alias="X-Session-Token"), session: Session = Depends(db)):
@@ -3752,7 +3952,7 @@ def client_message(conversation_id: UUID, body: ClientMessageIn, session_token: 
     if body.reply_to_message_id:
         parent=session.get(MarketplaceMessage,body.reply_to_message_id)
         if not parent or parent.conversation_id!=conv.id: raise HTTPException(status_code=422,detail="Reply target is not in this conversation")
-    now=datetime.now(UTC); translated,status,provider=_translate_marketplace(body.body,body.source_language,"es"); msg=MarketplaceMessage(conversation_id=conv.id,sender_role="client",source_language=body.source_language,body=body.body,translated_body=translated,translation_status=status,translation_provider=provider,reply_to_message_id=body.reply_to_message_id,delivery_status="partner_routed" if conv.partner_agency_id else "operator_queue"); session.add(msg); conv.updated_at=now; conv.last_client_activity_at=now; conv.workflow_status="waiting_partner" if conv.partner_agency_id else "new"; conv.next_action_type="contact_partner" if conv.partner_agency_id else "reply_client"; conv.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); _marketplace_metric(session,"conversation_message",actor_id=int(user["id"]) if user else None,object_id=conv.id,properties={"direction":"client_to_partner","translationStatus":status,"authMode":mode}); session.commit()
+    now=datetime.now(UTC); source_channel=_effective_channel(mode,body.source_channel); translated,status,provider=_translate_marketplace(body.body,body.source_language,"es"); msg=MarketplaceMessage(conversation_id=conv.id,sender_role="client",source_language=body.source_language,body=body.body,translated_body=translated,translation_status=status,translation_provider=provider,reply_to_message_id=body.reply_to_message_id,delivery_status="partner_routed" if conv.partner_agency_id else "operator_queue",source_channel=source_channel); session.add(msg); session.flush(); conv.updated_at=now; conv.last_client_activity_at=now; conv.workflow_status="waiting_partner" if conv.partner_agency_id else "new"; conv.next_action_type="contact_partner" if conv.partner_agency_id else "reply_client"; conv.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); _queue_communication_projection(session,conv.id,"message_created",message_id=msg.id); _marketplace_metric(session,"conversation_message",actor_id=int(user["id"]) if user else None,object_id=conv.id,properties={"direction":"client_to_partner","translationStatus":status,"authMode":mode,"sourceChannel":source_channel}); session.commit()
     if not conv.partner_agency_id: _operator_inquiry_notification(session,conv,message=translated or body.body)
     return {"ok":True,"id":str(msg.id),"translationStatus":status,"deliveryStatus":msg.delivery_status}
 
@@ -3767,7 +3967,7 @@ def partner_message(conversation_id: UUID, body: MessageIn, x_intent_key: str | 
     if body.reply_to_message_id:
         parent=session.get(MarketplaceMessage,body.reply_to_message_id)
         if not parent or parent.conversation_id!=conv.id: raise HTTPException(status_code=422,detail="Reply target is not in this conversation")
-    now=datetime.now(UTC); person=session.get(PersonProfile,conv.person_profile_id); target_language=(person.preferred_language if person and person.preferred_language in {"ru","es","en"} else "ru"); translated,status,provider=_translate_marketplace(body.body,body.source_language,target_language); msg=MarketplaceMessage(conversation_id=conv.id,sender_role="partner",source_language=body.source_language,body=body.body,translated_body=translated,translation_status=status,translation_provider=provider,reply_to_message_id=body.reply_to_message_id); session.add(msg); conv.updated_at=now; conv.last_operator_activity_at=now; conv.first_response_at=conv.first_response_at or now; conv.workflow_status="waiting_client"; conv.next_action_type="wait_client"; conv.next_action_due_at=None; session.flush(); _marketplace_metric(session,"partner_message",object_id=msg.id,properties={"conversationId":str(conv.id),"translationStatus":status}); session.commit()
+    now=datetime.now(UTC); person=session.get(PersonProfile,conv.person_profile_id); target_language=(person.preferred_language if person and person.preferred_language in {"ru","es","en"} else "ru"); translated,status,provider=_translate_marketplace(body.body,body.source_language,target_language); msg=MarketplaceMessage(conversation_id=conv.id,sender_role="partner",source_language=body.source_language,body=body.body,translated_body=translated,translation_status=status,translation_provider=provider,reply_to_message_id=body.reply_to_message_id,source_channel="internal"); session.add(msg); session.flush(); _queue_communication_projection(session,conv.id,"message_created",message_id=msg.id); conv.updated_at=now; conv.last_operator_activity_at=now; conv.first_response_at=conv.first_response_at or now; conv.workflow_status="waiting_client"; conv.next_action_type="wait_client"; conv.next_action_due_at=None; session.flush(); _marketplace_metric(session,"partner_message",object_id=msg.id,properties={"conversationId":str(conv.id),"translationStatus":status}); session.commit()
     delivered=bool(person and person.telegram_user_id and person.telegram_user_id>0 and _bot_send(person.telegram_user_id,f"💬 <b>Новый ответ по объекту</b>\n\n{html.escape(translated or body.body)}",reply_markup={"inline_keyboard":[[{"text":"Открыть объект","web_app":{"url":f'{settings.miniapp_url}/?listing={conv.listing_code}'}}]]}))
     msg.delivery_status="delivered" if delivered else "stored"; session.commit(); return {"ok":True,"id":str(msg.id),"translationStatus":status,"deliveryStatus":msg.delivery_status}
 
@@ -3810,11 +4010,14 @@ def client_viewing_action(viewing_id: UUID, action: str, init_data: str = Query(
 def internal_conversations(queue: str = Query(default="needs_action"), x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
     _marketplace_service_auth(x_intent_key); now=datetime.now(UTC); query=select(MarketplaceConversation).where(MarketplaceConversation.tenant==settings.growth_tenant,MarketplaceConversation.status=="open")
     if queue=="overdue": query=query.where(MarketplaceConversation.next_action_due_at.is_not(None),MarketplaceConversation.next_action_due_at<now)
+    elif queue=="rescue": query=query.where(MarketplaceConversation.escalation_level>=2)
+    elif queue=="waiting_partner": query=query.where(MarketplaceConversation.workflow_status=="waiting_partner")
     elif queue=="waiting_client": query=query.where(MarketplaceConversation.workflow_status=="waiting_client")
     elif queue=="scheduled": query=query.where(MarketplaceConversation.workflow_status=="scheduled")
+    elif queue=="new": query=query.where(MarketplaceConversation.workflow_status=="new")
     else: query=query.where(MarketplaceConversation.next_action_type.is_not(None),MarketplaceConversation.workflow_status.not_in(["waiting_client","scheduled"]))
     rows=list(session.scalars(query.order_by(MarketplaceConversation.next_action_due_at.asc().nullslast(),MarketplaceConversation.updated_at.desc()).limit(100)))
-    return {"items":[{"id":str(x.id),"listingCode":x.listing_code,"workflowStatus":x.workflow_status,"primaryIntent":x.primary_intent,"nextActionType":x.next_action_type,"nextActionDueAt":x.next_action_due_at.isoformat() if x.next_action_due_at else None,"overdue":bool(x.next_action_due_at and x.next_action_due_at<now),"updatedAt":x.updated_at.isoformat()} for x in rows]}
+    return {"items":[{"id":str(x.id),"listingCode":x.listing_code,"workflowStatus":x.workflow_status,"primaryIntent":x.primary_intent,"nextActionType":x.next_action_type,"nextActionDueAt":x.next_action_due_at.isoformat() if x.next_action_due_at else None,"overdue":bool(x.next_action_due_at and x.next_action_due_at<now),"assignedActorType":x.assigned_actor_type,"assignedActorId":x.assigned_actor_id,"assignedQueue":x.assigned_queue,"sourceChannel":x.source_channel,"escalationLevel":x.escalation_level,"rescueReason":x.rescue_reason,"updatedAt":x.updated_at.isoformat()} for x in rows]}
 
 @app.get("/v1/internal/conversations/{conversation_id}")
 def internal_conversation(conversation_id: UUID, x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
@@ -3822,7 +4025,7 @@ def internal_conversation(conversation_id: UUID, x_intent_key: str | None = Head
     if not row or row.tenant!=settings.growth_tenant: raise HTTPException(status_code=404,detail="Conversation not found")
     item=_conversation_listing(row) or {}; person=session.get(PersonProfile,row.person_profile_id); latest=session.scalar(select(MarketplaceMessage).where(MarketplaceMessage.conversation_id==row.id).order_by(MarketplaceMessage.created_at.desc()).limit(1)); req=session.scalar(select(MarketplaceViewingRequest).where(MarketplaceViewingRequest.conversation_id==row.id,MarketplaceViewingRequest.status=="pending").order_by(MarketplaceViewingRequest.created_at.desc()).limit(1))
     facts=(person.facts_json or {}) if person else {}
-    return {"id":str(row.id),"listingCode":row.listing_code,"listingAddress":item.get("address") or item.get("code") or row.listing_code,"workflowStatus":row.workflow_status,"primaryIntent":row.primary_intent,"nextActionType":row.next_action_type,"nextActionDueAt":row.next_action_due_at.isoformat() if row.next_action_due_at else None,"client":{"name":person.display_name if person else None,"username":person.username if person else None,"telegramUserId":person.telegram_user_id if person else None,"phone":facts.get("phone"),"email":facts.get("email")},"qualificationSnapshot":row.qualification_snapshot_json or {},"preferredWindows":req.preferred_windows_json if req else [],"lastMessage":(latest.translated_body or latest.body) if latest else ""}
+    return {"id":str(row.id),"listingCode":row.listing_code,"listingAddress":item.get("address") or item.get("code") or row.listing_code,"workflowStatus":row.workflow_status,"primaryIntent":row.primary_intent,"nextActionType":row.next_action_type,"nextActionDueAt":row.next_action_due_at.isoformat() if row.next_action_due_at else None,"client":{"name":person.display_name if person else None,"username":person.username if person else None,"telegramUserId":person.telegram_user_id if person else None,"phone":facts.get("phone"),"email":facts.get("email")},"qualificationSnapshot":row.qualification_snapshot_json or {},"preferredWindows":req.preferred_windows_json if req else [],"assignedActorType":row.assigned_actor_type,"assignedActorId":row.assigned_actor_id,"assignedQueue":row.assigned_queue,"routingDecision":row.routing_decision_json or {},"sourceChannel":row.source_channel,"preferredOutboundChannel":row.preferred_outbound_channel,"escalationLevel":row.escalation_level,"rescueReason":row.rescue_reason,"lastMessage":(latest.translated_body or latest.body) if latest else ""}
 
 @app.post("/v1/internal/conversations/{conversation_id}/unavailable")
 def mark_conversation_unavailable(conversation_id: UUID, x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
@@ -3834,6 +4037,194 @@ def mark_conversation_unavailable(conversation_id: UUID, x_intent_key: str | Non
     _marketplace_metric(session,"listing_unavailable_after_inquiry",object_id=conv.id); session.commit(); person=session.get(PersonProfile,conv.person_profile_id)
     if person and person.telegram_user_id and person.telegram_user_id>0: _bot_send(person.telegram_user_id,"Этот объект больше недоступен. Откройте каталог — подберём похожие варианты.",reply_markup={"inline_keyboard":[[{"text":"Показать другие варианты","web_app":{"url":settings.miniapp_url}}]]})
     return {"ok":True,"status":"unavailable","duplicate":False}
+
+@app.post("/v1/internal/conversations/rescue-sweep")
+def rescue_sweep(x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); now=datetime.now(UTC); changed=[]
+    rows=list(session.scalars(select(MarketplaceConversation).where(MarketplaceConversation.tenant==settings.growth_tenant,MarketplaceConversation.status=="open",MarketplaceConversation.next_action_due_at.is_not(None),MarketplaceConversation.next_action_due_at<now)))
+    for row in rows:
+        overdue=max(0,(now-row.next_action_due_at).total_seconds()/60)
+        level=3 if overdue>=settings.rescue_required_minutes else 2 if overdue>=settings.rescue_escalation_minutes else 1
+        if level>row.escalation_level:
+            row.escalation_level=level; row.rescue_reason="partner_non_response" if row.workflow_status=="waiting_partner" else "next_action_overdue"; row.updated_at=now
+            if level>=2 and row.assigned_queue!="central_rescue":
+                row.assigned_queue="central_rescue"
+            _marketplace_metric(session,"case_escalated",object_id=row.id,properties={"level":level,"reason":row.rescue_reason,"workflowStatus":row.workflow_status})
+            changed.append({"id":str(row.id),"level":level,"reason":row.rescue_reason})
+    session.commit(); return {"ok":True,"changed":changed,"count":len(changed)}
+
+@app.post("/v1/internal/listing-responsibilities")
+def upsert_listing_responsibility(body: ListingResponsibilityIn, x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key)
+    row=session.scalar(select(ListingResponsibility).where(ListingResponsibility.tenant==settings.growth_tenant,ListingResponsibility.inventory_source_id==body.inventory_source_id,ListingResponsibility.listing_key==body.listing_key))
+    if row is None:
+        row=ListingResponsibility(tenant=settings.growth_tenant,inventory_source_id=body.inventory_source_id,listing_key=body.listing_key,actor_type=body.actor_type,actor_id=body.actor_id); session.add(row)
+    row.operation=body.operation; row.actor_type=body.actor_type; row.actor_id=body.actor_id; row.fallback_actor_type=body.fallback_actor_type; row.fallback_actor_id=body.fallback_actor_id; row.metadata_json=body.metadata; row.active=True; row.updated_at=datetime.now(UTC); session.commit()
+    return {"ok":True,"id":str(row.id),"listingKey":row.listing_key,"actorType":row.actor_type,"actorId":row.actor_id}
+
+@app.get("/v1/internal/listing-responsibilities")
+def list_listing_responsibilities(x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); rows=list(session.scalars(select(ListingResponsibility).where(ListingResponsibility.tenant==settings.growth_tenant,ListingResponsibility.active.is_(True)).order_by(ListingResponsibility.updated_at.desc())))
+    return {"items":[{"id":str(x.id),"inventorySourceId":x.inventory_source_id,"listingKey":x.listing_key,"operation":x.operation,"actorType":x.actor_type,"actorId":x.actor_id,"fallbackActorType":x.fallback_actor_type,"fallbackActorId":x.fallback_actor_id} for x in rows]}
+
+def _handoff_snapshot(session: Session, conv: MarketplaceConversation) -> dict[str, Any]:
+    item=_conversation_listing(conv) or {}; person=session.get(PersonProfile,conv.person_profile_id); q=conv.qualification_snapshot_json or {}
+    return {"listingCode":conv.listing_code,"address":item.get("address") or item.get("code") or conv.listing_code,"operation":item.get("operation"),"language":person.preferred_language if person else None,"requestedOutcome":conv.primary_intent,"qualification":q,"demandOrigin":settings.brand_name,"inventorySource":item.get("sourceDisplayName") or item.get("sourceId") or conv.inventory_source_id}
+
+@app.post("/v1/internal/partner-handoffs")
+def create_partner_handoff(body: PartnerHandoffIn, x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); conv=session.get(MarketplaceConversation,body.conversation_id)
+    if not conv or conv.tenant!=settings.growth_tenant or conv.status!="open": raise HTTPException(status_code=404,detail="Open case not found")
+    if body.partner_agency_id:
+        partner=session.get(PartnerAgency,body.partner_agency_id)
+        if not partner or partner.tenant!=settings.growth_tenant: raise HTTPException(status_code=404,detail="Partner not found")
+    existing=session.scalar(select(PartnerHandoff).where(PartnerHandoff.conversation_id==conv.id,PartnerHandoff.status=="pending").order_by(PartnerHandoff.created_at.desc()).limit(1))
+    if existing: return {"ok":True,"id":str(existing.id),"status":existing.status,"duplicate":True,"expiresAt":existing.expires_at.isoformat()}
+    raw=secrets.token_urlsafe(32); now=datetime.now(UTC); row=PartnerHandoff(tenant=settings.growth_tenant,conversation_id=conv.id,partner_agency_id=body.partner_agency_id,transport=body.transport,recipient_ref=body.recipient_ref,sanitized_snapshot_json=_handoff_snapshot(session,conv),claim_token_hash=_token_hash(raw),status="pending",expires_at=now+timedelta(minutes=max(15,settings.partner_handoff_ttl_minutes)),created_at=now,updated_at=now); session.add(row); conv.workflow_status="waiting_partner"; conv.next_action_type="partner_claim"; conv.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); conv.rescue_reason=None; session.flush(); _marketplace_metric(session,"partner_handoff_created",object_id=row.id,properties={"conversationId":str(conv.id),"transport":body.transport}); session.commit()
+    return {"ok":True,"id":str(row.id),"status":row.status,"duplicate":False,"claimToken":raw,"expiresAt":row.expires_at.isoformat(),"snapshot":row.sanitized_snapshot_json}
+
+@app.post("/v1/partner-handoffs/claim")
+def claim_partner_handoff(body: PartnerHandoffClaimIn, session: Session = Depends(db)):
+    now=datetime.now(UTC); row=session.scalar(select(PartnerHandoff).where(PartnerHandoff.claim_token_hash==_token_hash(body.token))); conv=session.get(MarketplaceConversation,row.conversation_id) if row else None
+    if not row or not conv or row.tenant!=settings.growth_tenant: raise HTTPException(status_code=404,detail="Handoff not found")
+    if row.status in {"claimed","declined"}: return {"ok":True,"status":row.status,"duplicate":True}
+    if row.status!="pending" or row.expires_at<=now:
+        if row.status=="pending": row.status="expired"; row.updated_at=now; conv.escalation_level=max(conv.escalation_level,2); conv.assigned_queue="central_rescue"; conv.rescue_reason="partner_handoff_expired"; session.commit()
+        raise HTTPException(status_code=409,detail="Handoff expired")
+    row.status="claimed" if body.accept else "declined"; row.claimed_by=body.claimant; row.claimed_at=now; row.updated_at=now
+    if body.accept:
+        conv.assigned_actor_type="partner_agent"; conv.assigned_actor_id=body.claimant; conv.assigned_queue=f"partner:{row.partner_agency_id}" if row.partner_agency_id else "external_partner"; conv.workflow_status="in_progress"; conv.next_action_type="reply_client"; conv.next_action_due_at=now+timedelta(minutes=max(5,settings.operator_sla_minutes)); conv.rescue_reason=None
+    else:
+        conv.assigned_actor_type="queue"; conv.assigned_actor_id="central_rescue"; conv.assigned_queue="central_rescue"; conv.workflow_status="new"; conv.next_action_type="reroute_partner"; conv.next_action_due_at=now; conv.escalation_level=max(conv.escalation_level,2); conv.rescue_reason="partner_declined"
+    _marketplace_metric(session,"partner_handoff_claimed" if body.accept else "partner_handoff_declined",object_id=row.id,properties={"conversationId":str(conv.id)}); session.commit(); return {"ok":True,"status":row.status,"duplicate":False}
+
+@app.get("/v1/internal/partner-handoffs")
+def list_partner_handoffs(status: str = Query(default="pending"), x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); rows=list(session.scalars(select(PartnerHandoff).where(PartnerHandoff.tenant==settings.growth_tenant,PartnerHandoff.status==status).order_by(PartnerHandoff.created_at.desc()).limit(100)))
+    return {"items":[{"id":str(x.id),"conversationId":str(x.conversation_id),"partnerAgencyId":str(x.partner_agency_id) if x.partner_agency_id else None,"transport":x.transport,"status":x.status,"snapshot":x.sanitized_snapshot_json,"sentAt":x.sent_at.isoformat() if x.sent_at else None,"expiresAt":x.expires_at.isoformat(),"claimedAt":x.claimed_at.isoformat() if x.claimed_at else None,"claimedBy":x.claimed_by,"attempts":x.attempts,"lastError":x.last_error} for x in rows]}
+
+def _chatwoot_configured() -> bool:
+    return bool(settings.chatwoot_enabled and settings.chatwoot_base_url.strip() and settings.chatwoot_account_id and settings.chatwoot_api_inbox_id and settings.chatwoot_api_token.strip())
+
+def _chatwoot_api(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not _chatwoot_configured(): raise RuntimeError("Chatwoot integration is not configured")
+    url=settings.chatwoot_base_url.rstrip("/")+path
+    headers={"Authorization":f"Bearer {settings.chatwoot_api_token.strip()}","Content-Type":"application/json"}
+    with httpx.Client(timeout=10.0) as client:
+        response=client.request(method,url,headers=headers,json=payload)
+    if response.status_code>=400: raise RuntimeError(f"Chatwoot HTTP {response.status_code}: {response.text[:500]}")
+    try: return response.json()
+    except Exception: return {}
+
+def _chatwoot_contact_parts(data: dict[str, Any]) -> tuple[str | None,str | None]:
+    candidates=[]
+    if isinstance(data,dict):
+        candidates.append(data)
+        payload=data.get("payload")
+        if isinstance(payload,dict):
+            candidates.append(payload.get("contact") if isinstance(payload.get("contact"),dict) else payload)
+        elif isinstance(payload,list) and payload and isinstance(payload[0],dict):
+            candidates.append(payload[0])
+    contact_id=None; source_id=None
+    for candidate in candidates:
+        if not isinstance(candidate,dict): continue
+        contact_id=contact_id or candidate.get("id")
+        inboxes=candidate.get("contact_inboxes") or []
+        if isinstance(inboxes,dict): inboxes=[inboxes]
+        for inbox in inboxes:
+            if isinstance(inbox,dict) and inbox.get("source_id"):
+                source_id=inbox.get("source_id"); break
+        if contact_id and source_id: break
+    return str(contact_id) if contact_id is not None else None,str(source_id) if source_id else None
+
+def _ensure_chatwoot_projection(session: Session, conv: MarketplaceConversation) -> CommunicationProjection:
+    projection=session.scalar(select(CommunicationProjection).where(CommunicationProjection.provider=="chatwoot",CommunicationProjection.conversation_id==conv.id))
+    if projection is None:
+        projection=CommunicationProjection(provider="chatwoot",conversation_id=conv.id,sync_status="pending"); session.add(projection); session.flush()
+    if projection.external_conversation_id and projection.external_contact_id: return projection
+    person=session.get(PersonProfile,conv.person_profile_id)
+    if not person: raise RuntimeError("Person profile missing")
+    facts=person.facts_json or {}; identifier=f"pn-person-{person.id}"
+    contact_payload={"inbox_id":settings.chatwoot_api_inbox_id,"name":person.display_name or person.username or "Клиент","identifier":identifier,"additional_attributes":{"property_network_person_id":str(person.id),"preferred_language":person.preferred_language}}
+    if facts.get("email"): contact_payload["email"]=str(facts.get("email"))
+    if facts.get("phone"): contact_payload["phone_number"]=str(facts.get("phone"))
+    created=_chatwoot_api("POST",f"/api/v1/accounts/{settings.chatwoot_account_id}/contacts",contact_payload)
+    contact_id,source_id=_chatwoot_contact_parts(created)
+    if not contact_id: raise RuntimeError("Chatwoot contact response missing id")
+    if not source_id:
+        source_id=f"pn-{person.id}"
+        linked=_chatwoot_api("POST",f"/api/v1/accounts/{settings.chatwoot_account_id}/contacts/{contact_id}/contact_inboxes",{"inbox_id":settings.chatwoot_api_inbox_id,"source_id":source_id})
+        if isinstance(linked,dict) and linked.get("source_id"): source_id=str(linked.get("source_id"))
+    item=_conversation_listing(conv) or {}
+    conversation_payload={"source_id":source_id,"inbox_id":settings.chatwoot_api_inbox_id,"contact_id":int(contact_id),"status":"open","additional_attributes":{"property_network_case_id":str(conv.id),"listing_code":conv.listing_code,"listing_address":item.get("address") or item.get("code") or conv.listing_code,"source_channel":conv.source_channel,"assigned_queue":conv.assigned_queue,"product":settings.brand_name}}
+    cw_conv=_chatwoot_api("POST",f"/api/v1/accounts/{settings.chatwoot_account_id}/conversations",conversation_payload)
+    conversation_id=cw_conv.get("id") if isinstance(cw_conv,dict) else None
+    if conversation_id is None: raise RuntimeError("Chatwoot conversation response missing id")
+    projection.external_contact_id=str(contact_id); projection.external_conversation_id=str(conversation_id); projection.external_inbox_id=str(settings.chatwoot_api_inbox_id); projection.sync_status="synced"; projection.last_error=None; projection.updated_at=datetime.now(UTC); session.flush(); return projection
+
+def _drain_chatwoot_outbox(session: Session, limit: int = 20) -> dict[str, Any]:
+    if not _chatwoot_configured(): return {"enabled":settings.chatwoot_enabled,"configured":False,"processed":0,"sent":0,"failed":0}
+    now=datetime.now(UTC); rows=list(session.scalars(select(CommunicationOutbox).where(CommunicationOutbox.provider=="chatwoot",CommunicationOutbox.status.in_(["pending","failed"]),((CommunicationOutbox.next_attempt_at.is_(None))|(CommunicationOutbox.next_attempt_at<=now))).order_by(CommunicationOutbox.created_at.asc()).limit(max(1,min(100,limit)))))
+    sent=0; failed=0
+    for row in rows:
+        try:
+            if not row.conversation_id: raise RuntimeError("Outbox row has no conversation")
+            conv=session.get(MarketplaceConversation,row.conversation_id)
+            if not conv: raise RuntimeError("Canonical conversation missing")
+            projection=_ensure_chatwoot_projection(session,conv)
+            if row.kind=="message_created" and row.message_id:
+                msg=session.get(MarketplaceMessage,row.message_id)
+                if not msg: raise RuntimeError("Canonical message missing")
+                content=(msg.translated_body if msg.sender_role=="client" and msg.translation_status in {"translated","not_needed"} and msg.translated_body else msg.body)
+                result=_chatwoot_api("POST",f"/api/v1/accounts/{settings.chatwoot_account_id}/conversations/{projection.external_conversation_id}/messages",{"content":content,"message_type":"incoming","private":False,"content_type":"text","content_attributes":{"property_network_message_id":str(msg.id),"source_channel":msg.source_channel}})
+                if isinstance(result,dict) and result.get("id") is not None: row.external_delivery_id=str(result.get("id"))
+            row.status="sent"; row.attempts+=1; row.last_error=None; row.next_attempt_at=None; row.updated_at=now; sent+=1
+        except Exception as exc:
+            row.status="failed"; row.attempts+=1; row.last_error=str(exc)[:500]; row.next_attempt_at=now+timedelta(minutes=min(60,2**min(row.attempts,5))); row.updated_at=now; failed+=1
+        session.commit()
+    return {"enabled":True,"configured":True,"processed":len(rows),"sent":sent,"failed":failed}
+
+def _verify_chatwoot_webhook(raw: bytes, timestamp: str, signature: str) -> bool:
+    if not settings.chatwoot_webhook_secret or not timestamp or not signature: return False
+    try: ts=int(timestamp)
+    except ValueError: return False
+    if abs(int(datetime.now(UTC).timestamp())-ts)>max(60,settings.chatwoot_webhook_max_age_seconds): return False
+    expected="sha256="+hmac.new(settings.chatwoot_webhook_secret.encode(),timestamp.encode()+b"."+raw,hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected,signature)
+
+@app.post("/v1/integrations/chatwoot/webhook")
+async def chatwoot_webhook(request: Request, session: Session = Depends(db)):
+    raw=await request.body(); signature=request.headers.get("X-Chatwoot-Signature",""); timestamp=request.headers.get("X-Chatwoot-Timestamp",""); delivery=request.headers.get("X-Chatwoot-Delivery","")
+    if not _verify_chatwoot_webhook(raw,timestamp,signature): raise HTTPException(status_code=401,detail="Invalid Chatwoot signature")
+    if delivery and session.scalar(select(IntegrationDelivery).where(IntegrationDelivery.provider=="chatwoot",IntegrationDelivery.delivery_id==delivery)): return {"ok":True,"duplicate":True}
+    try: payload=json.loads(raw)
+    except Exception: raise HTTPException(status_code=400,detail="Invalid JSON")
+    event_name=str(payload.get("event") or "")
+    if delivery: session.add(IntegrationDelivery(provider="chatwoot",delivery_id=delivery,event_name=event_name))
+    if event_name!="message_created": session.commit(); return {"ok":True,"ignored":True}
+    if bool(payload.get("private")): session.commit(); return {"ok":True,"ignored":True}
+    sender=payload.get("sender") or {}; sender_type=str(sender.get("type") or "").lower()
+    if sender_type in {"contact"}: session.commit(); return {"ok":True,"ignored":True}
+    cw_conv=payload.get("conversation") or {}; external_id=str(cw_conv.get("id") or "")
+    projection=session.scalar(select(CommunicationProjection).where(CommunicationProjection.provider=="chatwoot",CommunicationProjection.external_conversation_id==external_id))
+    if not projection: session.commit(); return {"ok":True,"ignored":True,"reason":"projection_missing"}
+    conv=session.get(MarketplaceConversation,projection.conversation_id); content=str(payload.get("content") or "").strip()
+    if not conv or not content: session.commit(); return {"ok":True,"ignored":True}
+    ext_msg=str(payload.get("id") or "")
+    if ext_msg and session.scalar(select(MarketplaceMessage).where(MarketplaceMessage.external_provider=="chatwoot",MarketplaceMessage.external_message_id==ext_msg)): session.commit(); return {"ok":True,"duplicate":True}
+    person=session.get(PersonProfile,conv.person_profile_id); target_language=person.preferred_language if person and person.preferred_language in {"ru","es","en"} else "ru"; translated,status,provider=_translate_marketplace(content,"es",target_language); now=datetime.now(UTC); msg=MarketplaceMessage(conversation_id=conv.id,sender_role="partner",source_language="es",body=content,translated_body=translated,translation_status=status,translation_provider=provider,delivery_status="stored",source_channel="chatwoot",external_provider="chatwoot",external_message_id=ext_msg or None); session.add(msg); conv.updated_at=now; conv.last_operator_activity_at=now; conv.first_response_at=conv.first_response_at or now; conv.workflow_status="waiting_client"; conv.next_action_type="wait_client"; conv.next_action_due_at=None
+    delivered=False
+    if person and person.telegram_user_id and person.telegram_user_id>0 and conv.preferred_outbound_channel=="telegram": delivered=bool(_bot_send(person.telegram_user_id,f"💬 <b>Новый ответ по объекту</b>\n\n{html.escape(translated or content)}"))
+    msg.delivery_status="delivered" if delivered else "stored"; _marketplace_metric(session,"chatwoot_agent_message",object_id=msg.id,properties={"conversationId":str(conv.id),"deliveryStatus":msg.delivery_status}); session.commit(); return {"ok":True,"messageId":str(msg.id),"deliveryStatus":msg.delivery_status}
+
+@app.get("/v1/internal/integrations/chatwoot/status")
+def chatwoot_status(x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); pending=session.query(CommunicationOutbox).filter(CommunicationOutbox.provider=="chatwoot",CommunicationOutbox.status.in_(["pending","failed"])).count(); projected=session.query(CommunicationProjection).filter(CommunicationProjection.provider=="chatwoot").count()
+    return {"enabled":settings.chatwoot_enabled,"configured":_chatwoot_configured(),"pendingOutbox":pending,"projections":projected}
+
+@app.post("/v1/internal/integrations/chatwoot/drain")
+def chatwoot_drain(limit: int = Query(default=20,ge=1,le=100), x_intent_key: str | None = Header(default=None), session: Session = Depends(db)):
+    _marketplace_service_auth(x_intent_key); return _drain_chatwoot_outbox(session,limit)
 
 @app.post("/v1/collaboration-cases")
 def create_collaboration_case(body: CollaborationIn, session: Session = Depends(db)):
