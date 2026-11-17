@@ -153,7 +153,7 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
             skipped['not_available_status'] += 1
             continue
         tokko_id = raw.get('id')
-        if integer(tokko_id) is None:
+        if not clean(tokko_id).isdigit() or int(tokko_id) <= 0:
             skipped['invalid_tokko_id'] += 1
             continue
         code = clean(raw.get('reference_code')) or f'TOKKO{tokko_id}'
