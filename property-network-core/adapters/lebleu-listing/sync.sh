@@ -92,7 +92,7 @@ echo "[$(date -Is)] publish start"
 # Publisher checkpoints its state after every object. Bound the whole run so a
 # Telegram/network anomaly cannot wedge the sync service forever. A later sync safely resumes.
 if ! timeout 600s npx tsx scripts/telegram-publisher.ts --apply \
-  --limit-new 2 --limit-reposts 2; then
+  --limit-new 2 --limit-reposts 2 --limit-edits 5 --limit-relinks 5; then
   echo "[$(date -Is)] ERROR telegram publisher failed or exceeded 10 minutes"
   exit 1
 fi
