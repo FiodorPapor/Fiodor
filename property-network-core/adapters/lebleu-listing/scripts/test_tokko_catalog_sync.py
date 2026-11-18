@@ -96,6 +96,25 @@ class TokkoSyncTests(unittest.TestCase):
         self.assertEqual(2,len(rows))
         self.assertTrue(any(c['type']=='duplicate_public_listing_tokens' for c in report['match_conflicts']))
 
+    def test_reviewed_content_fingerprints_survive_first_tokko_baseline(self):
+        x=obj()
+        old=legacy()
+        old[0].update(priceAmount='679000',priceCurrency='ARS',sourceFingerprint='old-source-review',
+                      ruContentFingerprint='old-ru-review',highlightedFeatures=['Balcón'],
+                      details={'totalAreaM2':40,'bedrooms':1},description='Luminoso, listo para habitar')
+        rows,report=mod.build_candidate([x],old)
+        self.assertEqual('old-source-review',rows[0]['sourceFingerprint'])
+        self.assertEqual('old-ru-review',rows[0]['ruContentFingerprint'])
+        self.assertIn('Balcón',rows[0]['highlightedFeatures'])
+        self.assertEqual(1,rows[0]['details']['bedrooms'])
+        self.assertTrue(rows[0]['tokkoSnapshotFingerprint'])
+        rows2,_=mod.build_candidate([x],rows)
+        self.assertEqual('old-ru-review',rows2[0]['ruContentFingerprint'])
+        x['operations'][0]['prices'][0]['price']=700000
+        rows3,_=mod.build_candidate([x],rows2)
+        self.assertNotEqual('old-source-review',rows3[0]['sourceFingerprint'])
+        self.assertNotEqual('old-ru-review',rows3[0]['ruContentFingerprint'])
+
     def test_output_guard(self):
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'fixture.json'; f.write_text(json.dumps({'objects':[obj()]}))
