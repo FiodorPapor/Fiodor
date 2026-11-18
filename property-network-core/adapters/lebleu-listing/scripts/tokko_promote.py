@@ -80,6 +80,10 @@ def execute(args):
     if problems:
         print(json.dumps(info,ensure_ascii=False))
         return 2
+    if old_bytes == new_bytes:
+        info['unchanged'] = True
+        print(json.dumps(info,ensure_ascii=False))
+        return 0
     if not args.apply:
         print(json.dumps(info,ensure_ascii=False))
         return 0
