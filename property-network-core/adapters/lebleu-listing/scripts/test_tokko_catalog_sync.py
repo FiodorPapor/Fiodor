@@ -115,6 +115,26 @@ class TokkoSyncTests(unittest.TestCase):
         self.assertNotEqual('old-source-review',rows3[0]['sourceFingerprint'])
         self.assertNotEqual('old-ru-review',rows3[0]['ruContentFingerprint'])
 
+    def test_reviewed_tokko_duplicate_suppressed_without_removing_old_card(self):
+        canonical=obj(code='LAP7925869', address='Maure al 4000', operation='Venta')
+        canonical['operations'][0]['prices'][0]={'price':129900,'currency':'USD'}
+        canonical['total_surface']='45.50'
+        duplicate=obj(code='LAP6949373', address='Maure al 4000', operation='Venta')
+        duplicate['id']=101
+        duplicate['operations'][0]['prices'][0]={'price':129900,'currency':'USD'}
+        duplicate['total_surface']='42.0'
+        old=[dict(legacy()[0],code='LAP7925869', operation='Venta',
+                  address='Maure al 4000')]
+        rows,report=mod.build_candidate([canonical,duplicate],old)
+        self.assertEqual(1,len(rows))
+        self.assertEqual('LAP7925869',rows[0]['code'])
+        self.assertEqual('LAP6949373',report['suppressed_duplicates'][0]['suppressed_code'])
+        self.assertTrue(report['ready_for_cutover'])
+        duplicate['operations'][0]['prices'][0]['price']=150000
+        rows2,report2=mod.build_candidate([canonical,duplicate],old)
+        self.assertFalse(report2['ready_for_cutover'])
+        self.assertEqual('verified_duplicate_facts_diverged',report2['match_conflicts'][0]['type'])
+
     def test_output_guard(self):
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'fixture.json'; f.write_text(json.dumps({'objects':[obj()]}))
