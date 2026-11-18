@@ -341,12 +341,51 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
             continue
         generated.remove(duplicate)
         suppressed_duplicates.append({'suppressed_code': alias, 'canonical_code': canonical, 'reason': 'verified_existing_card_visual_duplicate'})
+    # Tokko may publish Venta + Alquiler with the SAME ficha.info URL and
+    # reference_code. Public tokens are code+hash(sourceUrl), so each operation
+    # requires its own permanent sourceUrl identity. Fragment-only suffixes
+    # still open the genuine ficha.info page and do not affect its HTTP path.
+    # Never change a URL already present in the historic catalog.
+    token_groups = defaultdict(list)
+    for item in generated:
+        fingerprint = f"{item['code']}_{hashlib.sha256(item['sourceUrl'].encode()).hexdigest()[:8]}"
+        token_groups[fingerprint].append(item)
+    identity_disambiguations = []
+    for collision in token_groups.values():
+        if len(collision) < 2:
+            continue
+        ordered = sorted(
+            collision,
+            key=lambda item: (
+                0 if by_codeop.get((norm(item['code']), item['operation'])) else 1,
+                0 if item['operation'] == 'Venta' else 1,
+                item['operation'],
+            ),
+        )
+        for item in ordered[1:]:
+            if by_codeop.get((norm(item['code']), item['operation'])):
+                conflicts.append({'code': item['code'], 'type': 'historical_public_token_collision'})
+                continue
+            original_url = item['sourceUrl']
+            parts = urllib.parse.urlsplit(original_url)
+            fragment = 'tokko-' + norm(item['operation']).replace(' ', '-')
+            item['sourceUrl'] = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, parts.query, fragment)
+            )
+            item['sourceFingerprint'] = hashjson({
+                k: item[k] for k in (
+                    'sourceUrl', 'priceAmount', 'priceCurrency', 'address',
+                    'description', 'details', 'imageUrls',
+                )
+            })
+            identity_disambiguations.append({
+                'code': item['code'], 'operation': item['operation'],
+                'method': 'ficha_info_fragment_preserving_http_path',
+            })
     if len({(x['sourceUrl'], x['operation']) for x in generated}) != len(generated):
         raise RuntimeError('Duplicate sourceURL+operation detected')
     tokens = [f"{x['code']}_{hashlib.sha256(x['sourceUrl'].encode()).hexdigest()[:8]}" for x in generated]
     if len(set(tokens)) != len(tokens):
-        # A single Tokko property can have sale and rental operations. They
-        # must not use identical public listing tokens, even if their URL is equal.
         conflicts.append({'type': 'duplicate_public_listing_tokens', 'count': len(tokens)-len(set(tokens))})
     coverage = len(matched_ids) / len(legacy) if legacy else 1.0
     counts = Counter(x['operation'] for x in generated)
@@ -355,6 +394,7 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
         'legacy_matched': len(matched_ids), 'legacy_coverage': round(coverage, 4),
         'unmatched_legacy': len(legacy) - len(matched_ids), 'operation_counts': dict(counts),
         'skipped_reasons': dict(skipped), 'secondary_matches': secondary_matches, 'suppressed_duplicates': suppressed_duplicates,
+        'identity_disambiguations': identity_disambiguations,
         'match_conflicts': conflicts[:25],
         'ready_for_cutover': coverage >= 0.90 and len(generated) >= max(1, (9 * len(legacy) + 9)//10) and not conflicts,
         'policy': 'STAGING ONLY. A separate approved cutover must verify token parity, QA, backup and rollback.',
