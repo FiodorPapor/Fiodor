@@ -67,6 +67,35 @@ class TokkoSyncTests(unittest.TestCase):
         self.assertEqual(1,len(rows))
         self.assertEqual(0,report['skipped_reasons'].get('invalid_tokko_id',0))
 
+    def test_secondary_matching_repairs_scraper_address_not_real_change(self):
+        x=obj(code='LAP123', address='Maure al 4000', operation='Venta')
+        x['operations'][0]['prices'][0]={'price':129900,'currency':'USD'}
+        x['total_surface']='45.50'
+        x['description']='Venta monoambiente en Maure 4000, con balcón, espacioso living'
+        old=[dict(legacy()[0],code='LAP123',operation='Venta', propertyType='Departamento',
+                  priceCurrency='USD',priceAmount='129900',details={'totalAreaM2':45.5},
+                  description=x['description'],address='Gran ubicación en Chacarita')]
+        rows,report=mod.build_candidate([x],old)
+        self.assertTrue(report['ready_for_cutover'])
+        self.assertEqual(1,len(report['secondary_matches']))
+        self.assertEqual(old[0]['sourceUrl'],rows[0]['sourceUrl'])
+        self.assertEqual('Maure al 4000',rows[0]['address'])
+
+    def test_feature_tags_and_zero_rooms(self):
+        x=obj()
+        x['tags']=[{'name':'Balcón'},{'name':'SUM'},{'name':'Laundry'},{'name':'garbage'}]
+        x['room_amount']=0
+        rows,_=mod.build_candidate([x],legacy())
+        self.assertEqual({'Balcón','SUM','Laundry'},set(rows[0]['highlightedFeatures']))
+        self.assertNotIn('rooms',rows[0]['details'])
+
+    def test_sale_and_rent_same_tokko_link_must_block_public_token_collision(self):
+        x=obj(code='NO_OLD')
+        x['operations'].append({'operation_type':'Venta','prices':[{'price':190000,'currency':'USD'}]})
+        rows,report=mod.build_candidate([x],legacy())
+        self.assertEqual(2,len(rows))
+        self.assertTrue(any(c['type']=='duplicate_public_listing_tokens' for c in report['match_conflicts']))
+
     def test_output_guard(self):
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'fixture.json'; f.write_text(json.dumps({'objects':[obj()]}))
