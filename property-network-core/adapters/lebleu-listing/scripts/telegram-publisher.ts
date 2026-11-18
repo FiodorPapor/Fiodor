@@ -483,6 +483,16 @@ async function main() {
   const maxMediaReposts = maxMediaArg >= 0 ? Math.max(0, Number(process.argv[maxMediaArg + 1] || "0")) : Number.POSITIVE_INFINITY;
   if (!Number.isFinite(maxMediaReposts) && maxMediaArg >= 0) throw new Error("Invalid --limit-reposts");
   let mediaReposts = 0;
+  const capValue = (arg: string): number => {
+    const index = process.argv.indexOf(arg);
+    if (index < 0) return Number.POSITIVE_INFINITY;
+    const value = Number(process.argv[index + 1]);
+    if (!Number.isInteger(value) || value < 0) throw new Error(`Invalid ${arg}`);
+    return value;
+  };
+  const maxEdits = capValue("--limit-edits");
+  const maxRelinks = capValue("--limit-relinks");
+  let edits = 0, relinks = 0;
   const onlyArg = process.argv.indexOf("--only-codes");
   const onlyCodes = new Set(onlyArg >= 0 ? String(process.argv[onlyArg + 1] || "").split(",").map(x => x.trim()).filter(Boolean) : []);
   const cfg = parseEnv(await fs.readFile(CONFIG_FILE, "utf8"));
@@ -576,6 +586,11 @@ async function main() {
     const leadInfo = await trackedLead(item, bot, growth);
     const leadHash = hash(`${CTA_VERSION}|${bot}|${leadInfo.marker}`);
     const old = state.entries[key];
+    if (apply && growth?.key && !leadInfo.marker.startsWith("trk_")) {
+      actions.push(`DEFER ${code} tracked growth link temporarily unavailable`);
+      blocked += 1;
+      continue;
+    }
     if (!old) {
       if (limitNew > 0 && created >= limitNew) { unchanged += 1; continue; }
       actions.push(`NEW ${codeOf(item)} ${item.address || ""}`);
@@ -635,12 +650,14 @@ async function main() {
       }
       photosChanged += 1;
     } else if (old.textHash !== textHash) {
+      if (apply && edits >= maxEdits) { unchanged += 1; continue; }
       actions.push(`EDIT ${codeOf(item)} text/price changed`);
       if (apply) {
         try {
           await editCaption(token, channel, old, caption, item, bot, leadInfo.url);
           state.entries[key] = { ...old, caption, textHash, leadHash, status: "active", tokkoPhotoFingerprint, updatedAt: new Date().toISOString() };
           await saveState(state);
+          edits += 1;
           console.log(`PROGRESS EDIT ${code}`);
         } catch (error) {
           errors += 1;
@@ -651,12 +668,14 @@ async function main() {
       }
       changed += 1;
     } else if (old.leadHash !== leadHash) {
+      if (apply && relinks >= maxRelinks) { unchanged += 1; continue; }
       actions.push(`RELINK ${codeOf(item)} CTA bot changed`);
       if (apply) {
         try {
           await editLeadLink(token, channel, old, item, bot, leadInfo.url);
           state.entries[key] = { ...old, leadHash, tokkoPhotoFingerprint, updatedAt: new Date().toISOString() };
           await saveState(state);
+          relinks += 1;
           console.log(`PROGRESS RELINK ${code}`);
           await new Promise(resolve => setTimeout(resolve, 250));
         } catch (error) {
