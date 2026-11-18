@@ -25,7 +25,8 @@ def check(old, new, audit):
         problems.append('tokko_stage_gate_failed')
     if audit.get('candidate_rows') != len(new) or audit.get('legacy_catalog') != len(old):
         problems.append('staging_size_mismatch')
-    if len(new)<len(old) or len(new)>len(old)+20:
+    max_safe_removals = max(5, int(len(old)*0.05+0.999))
+    if len(new) < len(old)-max_safe_removals or len(new) > len(old)+20:
         problems.append('unsafe_catalog_count_delta')
     old_index={(x.get('code'),x.get('operation')):x for x in old}
     new_index={(x.get('code'),x.get('operation')):x for x in new}
@@ -34,15 +35,22 @@ def check(old, new, audit):
     if len(set(token(x) for x in new))!=len(new):
         problems.append('public_token_collision')
     missing=set(old_index)-set(new_index)
-    if missing:
-        problems.append('legacy_missing:'+str(len(missing)))
-    else:
-        for key,previous in old_index.items():
-            current=new_index[key]
-            if token(previous)!=token(current):
-                problems.append('public_token_changed:'+str(key[0])[:45])
-            if previous.get('sourceUrl')!=current.get('sourceUrl'):
-                problems.append('source_url_changed:'+str(key[0])[:45])
+    confirmed=audit.get('confirmed_retirements') or []
+    allowed = {
+        (str(x.get('code') or ''),str(x.get('operation') or ''))
+        for x in confirmed if isinstance(x,dict)
+        and int(x.get('snapshots',0))>=2 and int(x.get('seconds_absent',0))>=3600
+    }
+    if missing != allowed or len(missing)>max_safe_removals:
+        problems.append('retirement_confirmation_mismatch:'+str(len(missing)))
+    for key,previous in old_index.items():
+        if key not in new_index:
+            continue
+        current=new_index[key]
+        if token(previous)!=token(current):
+            problems.append('public_token_changed:'+str(key[0])[:45])
+        if previous.get('sourceUrl')!=current.get('sourceUrl'):
+            problems.append('source_url_changed:'+str(key[0])[:45])
     for x in new:
         if not all([x.get('code'),x.get('operation'),x.get('sourceUrl'),
                     x.get('priceAmount'),x.get('priceCurrency'),x.get('imageUrls')]):
