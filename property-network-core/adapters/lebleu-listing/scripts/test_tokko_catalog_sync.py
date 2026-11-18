@@ -60,6 +60,13 @@ class TokkoSyncTests(unittest.TestCase):
         self.assertFalse(report['ready_for_cutover'])
         self.assertTrue(all('tokko-' in r['slug'] for r in rows))
 
+    def test_large_tokko_id_not_rejected(self):
+        x=obj(code='LAP123')
+        x['id']=14346637
+        rows, report=mod.build_candidate([x],legacy())
+        self.assertEqual(1,len(rows))
+        self.assertEqual(0,report['skipped_reasons'].get('invalid_tokko_id',0))
+
     def test_output_guard(self):
         with tempfile.TemporaryDirectory() as d:
             f=Path(d)/'fixture.json'; f.write_text(json.dumps({'objects':[obj()]}))
