@@ -89,12 +89,38 @@ class TokkoSyncTests(unittest.TestCase):
         self.assertEqual({'Balcón','SUM','Laundry'},set(rows[0]['highlightedFeatures']))
         self.assertNotIn('rooms',rows[0]['details'])
 
-    def test_sale_and_rent_same_tokko_link_must_block_public_token_collision(self):
+    def test_sale_and_rent_same_tokko_link_receive_unique_stable_public_tokens(self):
+        import hashlib
         x=obj(code='NO_OLD')
         x['operations'].append({'operation_type':'Venta','prices':[{'price':190000,'currency':'USD'}]})
-        rows,report=mod.build_candidate([x],legacy())
+        rows,report=mod.build_candidate([x],[])
         self.assertEqual(2,len(rows))
-        self.assertTrue(any(c['type']=='duplicate_public_listing_tokens' for c in report['match_conflicts']))
+        self.assertTrue(report['ready_for_cutover'])
+        self.assertFalse(report['match_conflicts'])
+        tokens=[i['code']+'_'+hashlib.sha256(i['sourceUrl'].encode()).hexdigest()[:8] for i in rows]
+        self.assertEqual(2,len(set(tokens)))
+        self.assertEqual('https://ficha.info/p/example',next(i for i in rows if i['operation']=='Venta')['sourceUrl'])
+        self.assertEqual('https://ficha.info/p/example#tokko-alquiler',
+                         next(i for i in rows if i['operation']=='Alquiler')['sourceUrl'])
+        self.assertEqual(1,len(report['identity_disambiguations']))
+        future,report2=mod.build_candidate([x],rows)
+        self.assertTrue(report2['ready_for_cutover'])
+        self.assertEqual({(i['code'],i['operation']):i['sourceUrl'] for i in rows},
+                         {(i['code'],i['operation']):i['sourceUrl'] for i in future})
+        self.assertEqual([],report2['identity_disambiguations'])
+
+    def test_multiop_added_to_historical_listing_preserves_old_public_token(self):
+        import hashlib
+        x=obj(code='LAP123')
+        x['operations'].append({'operation_type':'Venta','prices':[{'price':190000,'currency':'USD'}]})
+        rows,report=mod.build_candidate([x],legacy())
+        self.assertTrue(report['ready_for_cutover'])
+        rent=next(i for i in rows if i['operation']=='Alquiler')
+        sale=next(i for i in rows if i['operation']=='Venta')
+        self.assertEqual(legacy()[0]['sourceUrl'],rent['sourceUrl'])
+        self.assertEqual('https://ficha.info/p/example',sale['sourceUrl'])
+        self.assertNotEqual(hashlib.sha256(rent['sourceUrl'].encode()).hexdigest()[:8],
+                            hashlib.sha256(sale['sourceUrl'].encode()).hexdigest()[:8])
 
     def test_reviewed_content_fingerprints_survive_first_tokko_baseline(self):
         x=obj()
