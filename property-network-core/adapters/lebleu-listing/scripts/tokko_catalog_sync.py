@@ -254,13 +254,30 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
                 'slug': f'tokko-{tokko_id}-{norm(op_name).replace(" ", "-")}',
                 'code': code, 'operation': op_name, 'propertyType': type_name,
             }
-            # Reuse historical identity only after an exact code + operation + address check.
+            # Reuse historical identity and reviewed enrichment only after a strong match.
             if legacy_item:
                 item['slug'] = legacy_item.get('slug') or item['slug']
                 matched_ids.add(legacy_item.get('sourceUrl'))
                 if legacy_item.get('latitude') is not None and legacy_item.get('longitude') is not None:
                     item['latitude'] = legacy_item['latitude']
                     item['longitude'] = legacy_item['longitude']
+                # Tokko does not expose all website-assembled amenities/labels as
+                # direct scalar properties. Preserve already reviewed details while
+                # letting nonempty API fields override previous facts.
+                item['details'] = {**(legacy_item.get('details') or {}), **item['details']}
+                item['highlightedFeatures'] = list(dict.fromkeys(
+                    (legacy_item.get('highlightedFeatures') or []) + features
+                ))
+                for field in ('additionalInfo', 'services', 'environments', 'comforts'):
+                    if isinstance(legacy_item.get(field), type(item[field])):
+                        item[field] = legacy_item[field]
+                if item['propertyType'] == 'Terreno' and legacy_item.get('propertyType') == 'Terreno o Lote':
+                    item['propertyType'] = 'Terreno o Lote'
+                # Keep previously reviewed punctuation only when prose is
+                # semantically near-identical to current Tokko copy.
+                before, after = norm(legacy_item.get('description'))[:1500], norm(description)[:1500]
+                if before and after and SequenceMatcher(None, before, after).ratio() >= 0.95:
+                    item['description'] = legacy_item['description']
             # Tokko has no explicit expensas currency. For an existing reviewed
             # card, preserve its known currency only if the amount matches.
             expenses = positive(raw.get('expenses'))
@@ -268,8 +285,23 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
                 item['expensesAmount'] = str(expenses)
                 item['expensesCurrency'] = legacy_item['expensesCurrency']
             # New raw Tokko GPS is intentionally not published before geocoding QA.
-            item['sourceFingerprint'] = hashjson({k: item[k] for k in ('sourceUrl', 'priceAmount', 'priceCurrency', 'address', 'description', 'details', 'imageUrls')})
-            item['ruContentFingerprint'] = hashjson({k: item[k] for k in ('operation', 'propertyType', 'address', 'description', 'details', 'highlightedFeatures')})
+            # Baseline the first official Tokko snapshot without invalidating all
+            # existing RU reviews or forcing 134 false 'changed' notifications.
+            # Subsequent Tokko changes produce a new source version/fingerprint.
+            tokko_version = hashjson({
+                'id': tokko_id, 'operation': op_name, 'price': price,
+                'address': addr, 'description': description,
+                'photos': pictures, 'features': verified_features(raw),
+                'details': d, 'type': type_name,
+            })
+            item['tokkoSnapshotFingerprint'] = tokko_version
+            current_source = hashjson({k: item[k] for k in ('sourceUrl', 'priceAmount', 'priceCurrency', 'address', 'description', 'details', 'imageUrls')})
+            current_ru = hashjson({k: item[k] for k in ('operation', 'propertyType', 'address', 'description', 'details', 'highlightedFeatures')})
+            same_price = legacy_item and legacy_item.get('priceCurrency') == item['priceCurrency'] and positive(legacy_item.get('priceAmount')) == positive(item['priceAmount'])
+            same_version = legacy_item and legacy_item.get('tokkoSnapshotFingerprint') == tokko_version
+            first_baseline = legacy_item and not legacy_item.get('tokkoSnapshotFingerprint') and same_price
+            item['sourceFingerprint'] = (legacy_item.get('sourceFingerprint') or current_source) if (same_version or first_baseline) else current_source
+            item['ruContentFingerprint'] = (legacy_item.get('ruContentFingerprint') or current_ru) if (same_version or first_baseline) else current_ru
             generated.append(item)
     if len({(x['sourceUrl'], x['operation']) for x in generated}) != len(generated):
         raise RuntimeError('Duplicate sourceURL+operation detected')
