@@ -39,18 +39,45 @@ PY
 }
 
 drain_user_delete_queue
-echo "[$(date -Is)] scan start"
-npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @LeBleuArgentinaBot --chat-id @PREVIEW_ONLY
-
-echo "[$(date -Is)] catalog quality normalization"
-timeout 180s node scripts/normalize-catalog-quality.mjs
+SOURCE_MODE_FILE=/opt/property-network-tokko-staging/source-mode
+SOURCE_MODE="$(cat "$SOURCE_MODE_FILE" 2>/dev/null || echo website)"
+case "$SOURCE_MODE" in
+  website)
+    echo "[$(date -Is)] website source refresh (legacy rollback mode)"
+    npx tsx scripts/lebleu-telegram-sync.ts --out "$ROOT/public/data/full" --cta @LeBleuArgentinaBot --chat-id @PREVIEW_ONLY
+    echo "[$(date -Is)] website catalog visual deduplication"
+    timeout 180s node scripts/normalize-catalog-quality.mjs
+    ;;
+  tokko)
+    echo "[$(date -Is)] Tokko authenticated catalog fetch"
+    timeout 150s python3 /opt/property-network-tokko-staging/code/tokko_catalog_sync.py \
+      --legacy "$ROOT/public/data/full/catalog.json" \
+      --output-dir /opt/property-network-tokko-staging/candidate
+    echo "[$(date -Is)] Tokko withdrawal verification: two healthy snapshots"
+    timeout 15s python3 /opt/property-network-tokko-staging/code/tokko_retire.py
+    echo "[$(date -Is)] Tokko exact-token atomic promotion"
+    timeout 20s python3 /opt/property-network-tokko-staging/code/tokko_promote.py --apply
+    # No website scraping or large all-photo image hash pass in Tokko mode.
+    # Five independently checked physical duplicates are suppressed upstream.
+    ;;
+  *)
+    echo "Invalid source mode (accepted: tokko or website); refusing sync" >&2
+    exit 2
+    ;;
+esac
 
 echo "[$(date -Is)] Russian content candidate refresh"
 # Machine translation is staging only. It must never overwrite user-facing
 # reviewed Russian copy automatically; new/changed listings use the clean
 # structured Russian fallback until the candidate is reviewed.
-if ! timeout 150s "$ROOT/.venv-marian/bin/python" scripts/refresh-ru-content.py; then
-  echo "[$(date -Is)] WARN Russian content candidate refresh failed; using reviewed copy / structured fallback"
+if [[ "$SOURCE_MODE" == "website" ]]; then
+  if ! timeout 150s "$ROOT/.venv-runtime/bin/python" scripts/refresh-ru-content.py; then
+    echo "[$(date -Is)] WARN Russian content candidate refresh failed; using reviewed copy / structured fallback"
+  fi
+else
+  # Tokko can add new cards; unreviewed ones use trustworthy RU structured
+  # facts. Heavy machine translation is deferred until resource gate GREEN.
+  echo "[$(date -Is)] Tokko RU: preserve reviewed copy; structured fallback for new cards"
 fi
 
 # Official Argentina Georef reverse-geocoding is enrichment only. Keep the last
@@ -66,7 +93,8 @@ echo "[$(date -Is)] publish start"
 # New or changed source fingerprints fall back to clean structured facts until reviewed.
 # Publisher checkpoints its state after every object. Bound the whole run so a
 # Telegram/network anomaly cannot wedge the sync service forever. A later sync safely resumes.
-if ! timeout 600s npx tsx scripts/telegram-publisher.ts --apply; then
+if ! timeout 600s npx tsx scripts/telegram-publisher.ts --apply \
+  --limit-new 2 --limit-reposts 2 --limit-edits 5 --limit-relinks 5; then
   echo "[$(date -Is)] ERROR telegram publisher failed or exceeded 10 minutes"
   exit 1
 fi

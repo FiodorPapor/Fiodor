@@ -25,6 +25,7 @@ type Item = {
   priceCurrency?: string; expensesAmount?: string; expensesCurrency?: string;
   details?: Record<string, number>; highlightedFeatures?: string[];
   imageUrls?: string[]; sourceFingerprint?: string; ruContentFingerprint?: string; description?: string;
+  tokkoSnapshotFingerprint?: string;
 };
 type QualityContent = { code?: string; operation?: string; sourceFingerprint?: string; ruContentFingerprint?: string; summary_ru?: string; notes_ru?: string[]; details_override?: Record<string, number>; property_type_override?: string | null };
 type Entry = {
@@ -32,6 +33,9 @@ type Entry = {
   textHash: string; photoHash: string; leadHash?: string; messageIds: number[];
   threadId?: number; ctaMessageId?: number; mode: "album" | "media" | "text"; caption: string; updatedAt: string;
   botUsername?: string;
+  // First Tokko API cutover must not recreate existing Telegram posts solely
+  // because the same media arrived from a different CDN.
+  tokkoPhotoFingerprint?: string;
 };
 type State = { channel: string; entries: Record<string, Entry> };
 function parseEnv(text: string): Record<string, string> {
@@ -475,6 +479,20 @@ async function main() {
   const bootstrapOldestFirst = process.argv.includes("--bootstrap-oldest-first");
   const limitArg = process.argv.indexOf("--limit-new");
   const limitNew = limitArg >= 0 ? Number(process.argv[limitArg + 1] || "0") : 0;
+  const maxMediaArg = process.argv.indexOf("--limit-reposts");
+  const maxMediaReposts = maxMediaArg >= 0 ? Math.max(0, Number(process.argv[maxMediaArg + 1] || "0")) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(maxMediaReposts) && maxMediaArg >= 0) throw new Error("Invalid --limit-reposts");
+  let mediaReposts = 0;
+  const capValue = (arg: string): number => {
+    const index = process.argv.indexOf(arg);
+    if (index < 0) return Number.POSITIVE_INFINITY;
+    const value = Number(process.argv[index + 1]);
+    if (!Number.isInteger(value) || value < 0) throw new Error(`Invalid ${arg}`);
+    return value;
+  };
+  const maxEdits = capValue("--limit-edits");
+  const maxRelinks = capValue("--limit-relinks");
+  let edits = 0, relinks = 0;
   const onlyArg = process.argv.indexOf("--only-codes");
   const onlyCodes = new Set(onlyArg >= 0 ? String(process.argv[onlyArg + 1] || "").split(",").map(x => x.trim()).filter(Boolean) : []);
   const cfg = parseEnv(await fs.readFile(CONFIG_FILE, "utf8"));
@@ -558,17 +576,28 @@ async function main() {
     if (!q) actions.push(`TEXT_FALLBACK ${code} no_current_reviewed_copy`);
     const textHash = hash(caption);
     const photoHash = hash([MEDIA_VERSION, (item.imageUrls || []).slice(0, PREVIEW_PHOTO_LIMIT)]);
+    // Existing website photos and Tokko API photos use different URL hosts.
+    // Seed a stable API baseline without re-posting unchanged Telegram media;
+    // subsequent API photo changes trigger a bounded real re-post.
+    const tokkoPhotoFingerprint = item.tokkoSnapshotFingerprint
+      ? hash(item.imageUrls || [])
+      : undefined;
     const desiredMode: "album" | "media" | "text" = (item.imageUrls || []).length >= 1 ? "media" : "text";
     const leadInfo = await trackedLead(item, bot, growth);
     const leadHash = hash(`${CTA_VERSION}|${bot}|${leadInfo.marker}`);
     const old = state.entries[key];
+    if (apply && growth?.key && !leadInfo.marker.startsWith("trk_")) {
+      actions.push(`DEFER ${code} tracked growth link temporarily unavailable`);
+      blocked += 1;
+      continue;
+    }
     if (!old) {
       if (limitNew > 0 && created >= limitNew) { unchanged += 1; continue; }
       actions.push(`NEW ${codeOf(item)} ${item.address || ""}`);
       if (apply) {
         try {
           const createdEntry = await postItem(token, channel, item, caption, bot, desiredThreadId, leadInfo.url);
-          state.entries[key] = { ...createdEntry, leadHash };
+          state.entries[key] = { ...createdEntry, leadHash, tokkoPhotoFingerprint };
           await saveState(state);
           console.log(`PROGRESS NEW ${code}`);
           await new Promise(resolve => setTimeout(resolve, 500));
@@ -584,7 +613,15 @@ async function main() {
     }
     const oldBot = old.botUsername || "FiodorCRMControlBot";
     const ownerMigration = migrateBotOwnership && oldBot.replace(/^@/, "").toLowerCase() !== bot.replace(/^@/, "").toLowerCase();
-    if (old.status === "removed" || old.photoHash !== photoHash || old.mode !== desiredMode || old.threadId !== desiredThreadId || ownerMigration) {
+    const photoChanged = tokkoPhotoFingerprint
+      ? Boolean(old.tokkoPhotoFingerprint && old.tokkoPhotoFingerprint !== tokkoPhotoFingerprint)
+      : old.photoHash !== photoHash;
+    if (old.status === "removed" || photoChanged || old.mode !== desiredMode || old.threadId !== desiredThreadId || ownerMigration) {
+      if (apply && mediaReposts >= maxMediaReposts) {
+        actions.push(`DEFER_REPOST ${code} media replay cap reached`);
+        unchanged += 1;
+        continue;
+      }
       actions.push(`REPOST ${codeOf(item)} ${ownerMigration ? "bot ownership changed" : "media/status/topic changed"}`);
       if (apply) {
         try {
@@ -599,8 +636,9 @@ async function main() {
             try { await deleteEntryMessages(token, channel, replacement); } catch {}
             throw deleteError;
           }
-          state.entries[key] = { ...replacement, leadHash };
+          state.entries[key] = { ...replacement, leadHash, tokkoPhotoFingerprint };
           await saveState(state);
+          mediaReposts += 1;
           console.log(`PROGRESS REPOST ${code}`);
           await new Promise(resolve => setTimeout(resolve, 500));
         } catch (error) {
@@ -612,12 +650,14 @@ async function main() {
       }
       photosChanged += 1;
     } else if (old.textHash !== textHash) {
+      if (apply && edits >= maxEdits) { unchanged += 1; continue; }
       actions.push(`EDIT ${codeOf(item)} text/price changed`);
       if (apply) {
         try {
           await editCaption(token, channel, old, caption, item, bot, leadInfo.url);
-          state.entries[key] = { ...old, caption, textHash, leadHash, status: "active", updatedAt: new Date().toISOString() };
+          state.entries[key] = { ...old, caption, textHash, leadHash, status: "active", tokkoPhotoFingerprint, updatedAt: new Date().toISOString() };
           await saveState(state);
+          edits += 1;
           console.log(`PROGRESS EDIT ${code}`);
         } catch (error) {
           errors += 1;
@@ -628,12 +668,14 @@ async function main() {
       }
       changed += 1;
     } else if (old.leadHash !== leadHash) {
+      if (apply && relinks >= maxRelinks) { unchanged += 1; continue; }
       actions.push(`RELINK ${codeOf(item)} CTA bot changed`);
       if (apply) {
         try {
           await editLeadLink(token, channel, old, item, bot, leadInfo.url);
-          state.entries[key] = { ...old, leadHash, updatedAt: new Date().toISOString() };
+          state.entries[key] = { ...old, leadHash, tokkoPhotoFingerprint, updatedAt: new Date().toISOString() };
           await saveState(state);
+          relinks += 1;
           console.log(`PROGRESS RELINK ${code}`);
           await new Promise(resolve => setTimeout(resolve, 250));
         } catch (error) {
@@ -644,9 +686,19 @@ async function main() {
         }
       }
       changed += 1;
-    } else unchanged += 1;
+    } else {
+      unchanged += 1;
+      // Persist Tokko baseline once even when text/price have not changed.
+      // Subsequent real API photo changes can then be detected reliably.
+      if (apply && tokkoPhotoFingerprint && old.tokkoPhotoFingerprint !== tokkoPhotoFingerprint) {
+        state.entries[key] = { ...old, tokkoPhotoFingerprint };
+        await saveState(state);
+      }
+    }
   }
   for (const [key, old] of Object.entries(state.entries)) {
+    // --only-codes is a canary mode: it must NEVER remove excluded listings.
+    if (onlyCodes.size) break;
     if (current.has(key) || old.status === "removed" || failed.has(key)) continue;
     actions.push(`REMOVE ${old.code}`);
     if (apply) {

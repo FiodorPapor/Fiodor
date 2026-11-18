@@ -21,6 +21,8 @@ CATALOG_ALIASES = ROOT / "public/data/full/catalog-aliases.json"
 CHANNEL_INTEGRITY = ROOT / "state/channel-integrity.json"
 USER_DELETE_QUEUE = ROOT / "state/telegram-user-delete-queue.json"
 STATE = ROOT / "state/product-health.json"
+TOKKO_MODE_FILE = Path("/opt/property-network-tokko-staging/source-mode")
+TOKKO_AUDIT = Path("/opt/property-network-tokko-staging/candidate/audit.json")
 ENV = Path("/opt/property-intent-core/.env")
 MINIAPP_ENV = Path("/opt/lebleu-miniapp/.env")
 ALERT_ENV = Path("/opt/intent-radar/radar-alert.env")
@@ -109,6 +111,10 @@ def main() -> int:
     now = time.time()
     previous = load_json(STATE, {})
     issues: list[str] = []
+    warnings: list[str] = []
+    source_mode = TOKKO_MODE_FILE.read_text().strip() if TOKKO_MODE_FILE.exists() else "website"
+    if source_mode not in {"tokko", "website"}:
+        issues.append("неизвестный source-mode для каталога")
 
     stale_repls: list[str] = []
     rc, ps_output = cmd("ps", "-eo", "pid=,etimes=,args=")
@@ -168,15 +174,37 @@ def main() -> int:
     quality_photo_drops = int(quality.get("duplicatePhotosRemoved") or 0) if isinstance(quality, dict) else 0
     quality_image_errors = int(quality.get("imageErrors") or 0) if isinstance(quality, dict) else 0
     quality_version = str(quality.get("version") or "") if isinstance(quality, dict) else ""
-    if not quality_version.startswith("dedupe-v3-cross-type-image-verified"):
-        issues.append("catalog quality normalizer не v3 cross-type image-verified")
-    if catalog_count and quality_output_count != catalog_count:
-        issues.append(f"quality report не совпадает с каталогом: {quality_output_count}/{catalog_count}")
-    if quality_image_errors > max(3, int(max(quality_input_count, 1) * 0.03)):
-        issues.append(f"ошибки image dedupe: {quality_image_errors}")
-    if CATALOG_QUALITY.exists() and CATALOG.exists():
-        if CATALOG_QUALITY.stat().st_mtime + 5 < CATALOG.stat().st_mtime:
-            issues.append("quality report старее catalog.json")
+    if source_mode == "tokko":
+        # API feeds have their own independent, fail-closed freshness/quality
+        # gates. The old website image-deduplication report is historical only.
+        audit = load_json(TOKKO_AUDIT, {})
+        if not isinstance(audit, dict) or not audit.get("ready_for_cutover"):
+            issues.append("Tokko API: последний audit не прошёл quality gate")
+        else:
+            quality_version = "tokko-api-v1"
+            quality_input_count = int(audit.get("tokko_properties") or 0)
+            quality_output_count = int(audit.get("candidate_rows") or 0)
+            quality_suppressed_count = len(audit.get("suppressed_duplicates") or [])
+            quality_photo_drops = 0  # Legacy dedupe count is not API truth.
+            quality_image_errors = 0
+            if quality_output_count != catalog_count:
+                issues.append(f"Tokko API audit/catalog mismatch: {quality_output_count}/{catalog_count}")
+            if audit.get("match_conflicts"):
+                issues.append("Tokko API: unresolved match/duplicate conflicts")
+            if quality_input_count < 20:
+                issues.append("Tokko API: unexpectedly small raw response")
+            if TOKKO_AUDIT.exists() and CATALOG.exists() and TOKKO_AUDIT.stat().st_mtime + STALE_SECONDS < CATALOG.stat().st_mtime:
+                issues.append("Tokko API: latest audit is older than current catalog")
+    else:
+        if not quality_version.startswith("dedupe-v3-cross-type-image-verified"):
+            issues.append("catalog quality normalizer не v3 cross-type image-verified")
+        if catalog_count and quality_output_count != catalog_count:
+            issues.append(f"quality report не совпадает с каталогом: {quality_output_count}/{catalog_count}")
+        if quality_image_errors > max(3, int(max(quality_input_count, 1) * 0.03)):
+            issues.append(f"ошибки image dedupe: {quality_image_errors}")
+        if CATALOG_QUALITY.exists() and CATALOG.exists():
+            if CATALOG_QUALITY.stat().st_mtime + 5 < CATALOG.stat().st_mtime:
+                issues.append("quality report старее catalog.json")
 
     ru_quality = load_json(RU_CONTENT_QUALITY, {})
     ru_missing = 0
@@ -224,13 +252,22 @@ def main() -> int:
             content_issues.append(f"нужна проверка перевода: {ru_unreviewed}")
         examples = (ru_missing_examples + ru_stale_examples)[:4]
         detail = f". Объекты: {', '.join(examples)}" if examples else ""
-        issues.append("Русский контент: " + "; ".join(content_issues) + detail)
+        message = "Русский контент: " + "; ".join(content_issues) + detail
+        if source_mode == "tokko" and not (ru_non_russian or ru_unreviewed):
+            # The application already renders verified, structured Russian
+            # facts while editorial free-text translation is pending. Keep
+            # exact counts visible as an operational WARNING, not an outage.
+            warnings.append(message + " (в интерфейсе структурированный RU fallback)")
+        else:
+            issues.append(message)
 
     alias_payload = load_json(CATALOG_ALIASES, {})
     aliases = alias_payload.get("aliases", {}) if isinstance(alias_payload, dict) else {}
     alias_count = len(aliases) if isinstance(aliases, dict) else 0
-    if alias_count != quality_suppressed_count:
+    if source_mode == "website" and alias_count != quality_suppressed_count:
         issues.append(f"alias map не совпадает с dedupe: {alias_count}/{quality_suppressed_count}")
+    # In Tokko mode the old alias map preserves historical links; a separate
+    # verified five-item API-duplicate suppression has its own audit entries.
 
     channel_integrity = load_json(CHANNEL_INTEGRITY, {})
     if isinstance(channel_integrity, dict) and channel_integrity:
@@ -310,7 +347,7 @@ def main() -> int:
     if not map_renderer_ok:
         issues.append(f"Mini App map renderer unhealthy: {renderer_detail[:180]}")
 
-    current_status = "unhealthy" if issues else "healthy"
+    current_status = "unhealthy" if issues else ("degraded" if warnings else "healthy")
     previous_status = previous.get("status")
     previous_issues = previous.get("issues") or []
     # Operator health alerts belong in the dedicated Revenue Radar bot, never
@@ -320,20 +357,23 @@ def main() -> int:
     token = alert_env.get("RADAR_ALERT_BOT_TOKEN", "")
     chat_id = alert_env.get("RADAR_ALERT_CHAT_ID", "")
 
+    source_label = "Tokko API" if source_mode == "tokko" else "Le Bleu website"
     if issues and (previous_status != "unhealthy" or issues != previous_issues):
-        text = "⚠️ Где жить · качество каталога\nИсточник: Le Bleu\n" + "\n".join(f"• {x}" for x in issues)
+        text = f"⚠️ Где жить · качество каталога\nИсточник: {source_label}\n" + "\n".join(f"• {x}" for x in issues)
         send_telegram(token, chat_id, text)
-    elif not issues and previous_status == "unhealthy":
+    elif not issues and previous_status == "unhealthy" and not warnings:
         send_telegram(
             token,
             chat_id,
-            f"✅ Где жить · качество каталога восстановлено\nИсточник: Le Bleu · объектов: {catalog_count}.",
+            f"✅ Где жить · качество каталога восстановлено\nИсточник: {source_label} · объектов: {catalog_count}.",
         )
 
     next_state = {
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "status": current_status,
         "issues": issues,
+        "warnings": warnings,
+        "source_mode": source_mode,
         "catalog_count": catalog_count,
         "publisher_count": published_count,
         "geo_count": geo_count,
