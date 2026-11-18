@@ -24,6 +24,16 @@ PROD_CATALOG = Path('/opt/lebleu-listing-bridge/public/data/full/catalog.json')
 ALLOWED_IMG_HOSTS = {'static.tokkobroker.com'}
 OPS = {'venta': 'Venta', 'alquiler': 'Alquiler', 'alquiler temporario': 'Alquiler temporario'}
 TYPES = {'Local': 'Local Comercial', 'Terreno o Lote': 'Terreno', 'Galpon': 'Galpón'}
+FEATURE_NAMES = {
+    'balcon': 'Balcón', 'terraza': 'Terraza', 'parrilla': 'Parrilla',
+    'piscina': 'Piscina', 'pileta': 'Pileta', 'patio': 'Patio',
+    'jardin': 'Jardín', 'sum': 'SUM', 'laundry': 'Laundry',
+    'solarium': 'Solarium', 'baulera': 'Baulera', 'quincho': 'Quincho',
+    'gimnasio': 'Gimnasio', 'ascensor': 'Ascensor',
+    'aire acondicionado individual': 'Aire Acondicionado',
+    'aire acondicionado': 'Aire Acondicionado', 'calefaccion': 'Calefacción',
+    'seguridad 24 hs': 'Seguridad 24', 'apto credito bancario': 'Apto crédito',
+}
 
 
 def clean(value: Any) -> str:
@@ -87,6 +97,35 @@ def scrub_description(value: Any) -> str:
     return clean(s)[:4000]
 
 
+def trusted_secondary_match(old: dict, raw: dict, op_name: str, type_name: str, price: dict, description: str) -> bool:
+    # Only salvage legacy site address-parsing errors with strong *independent*
+    # Tokko facts. The primary reference_code + operation already matched uniquely.
+    if old.get('operation') != op_name or old.get('propertyType') != type_name:
+        return False
+    if old.get('priceCurrency') != price.get('currency'):
+        return False
+    a, b = positive(old.get('priceAmount')), positive(price.get('price'))
+    old_area = positive((old.get('details') or {}).get('totalAreaM2'))
+    new_area = positive(raw.get('total_surface'))
+    if a is None or b is None or abs(a-b)>0.01 or old_area is None or new_area is None:
+        return False
+    if abs(old_area-new_area)>0.05:
+        return False
+    before, after = norm(old.get('description'))[:1500], norm(description)[:1500]
+    return bool(before and after) and SequenceMatcher(None, before, after).ratio() >= 0.92
+
+
+def verified_features(raw: dict) -> list[str]:
+    names = []
+    for field in ('tags', 'custom_tags'):
+        for x in raw.get(field) if isinstance(raw.get(field), list) else []:
+            if isinstance(x, dict):
+                label = FEATURE_NAMES.get(norm(x.get('name')))
+                if label and label not in names:
+                    names.append(label)
+    return names
+
+
 def match_address(old: str, new: str) -> bool:
     a, b = norm(old), norm(new)
     if not a or not b:
@@ -148,6 +187,7 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
     skipped = Counter()
     conflicts = []
     matched_ids = set()
+    secondary_matches = []
     for raw in rows:
         if raw.get('status') != 2:
             skipped['not_available_status'] += 1
@@ -175,11 +215,15 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
                 skipped['incomplete_public_facts'] += 1
                 continue
             price = valid_prices[0]
+            description = scrub_description(raw.get('description'))
             candidates = by_codeop.get((norm(code), op_name), [])
             legacy_item = None
             if len(candidates) == 1:
                 if match_address(candidates[0].get('address', ''), addr):
                     legacy_item = candidates[0]
+                elif trusted_secondary_match(candidates[0], raw, op_name, type_name, price, description):
+                    legacy_item = candidates[0]
+                    secondary_matches.append({'code': code, 'type': 'independent_price_area_description_match'})
                 else:
                     conflicts.append({'code': code, 'type': 'address_mismatch'})
             elif len(candidates) > 1:
@@ -195,10 +239,9 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
                     d[key] = n
             for key, remote in [('rooms', 'room_amount'), ('bathrooms', 'bathroom_amount'), ('parkingSpaces', 'parking_lot_amount')]:
                 n = integer(raw.get(remote))
-                if n is not None and n <= 100:
+                if n is not None and n <= 100 and (n > 0 or key == 'parkingSpaces'):
                     d[key] = n
-            description = scrub_description(raw.get('description'))
-            features = []  # No inference from internal tags; only verified published facts.
+            features = verified_features(raw)  # Current Tokko feature tags, not legacy guesses.
             item = {
                 'title': clean(raw.get('publication_title')) or f'{type_name} · {addr}',
                 'address': addr, 'description': description,
@@ -218,19 +261,30 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
                 if legacy_item.get('latitude') is not None and legacy_item.get('longitude') is not None:
                     item['latitude'] = legacy_item['latitude']
                     item['longitude'] = legacy_item['longitude']
+            # Tokko has no explicit expensas currency. For an existing reviewed
+            # card, preserve its known currency only if the amount matches.
+            expenses = positive(raw.get('expenses'))
+            if legacy_item and expenses and positive(legacy_item.get('expensesAmount')) == expenses and legacy_item.get('expensesCurrency'):
+                item['expensesAmount'] = str(expenses)
+                item['expensesCurrency'] = legacy_item['expensesCurrency']
             # New raw Tokko GPS is intentionally not published before geocoding QA.
             item['sourceFingerprint'] = hashjson({k: item[k] for k in ('sourceUrl', 'priceAmount', 'priceCurrency', 'address', 'description', 'details', 'imageUrls')})
             item['ruContentFingerprint'] = hashjson({k: item[k] for k in ('operation', 'propertyType', 'address', 'description', 'details', 'highlightedFeatures')})
             generated.append(item)
     if len({(x['sourceUrl'], x['operation']) for x in generated}) != len(generated):
         raise RuntimeError('Duplicate sourceURL+operation detected')
+    tokens = [f"{x['code']}_{hashlib.sha256(x['sourceUrl'].encode()).hexdigest()[:8]}" for x in generated]
+    if len(set(tokens)) != len(tokens):
+        # A single Tokko property can have sale and rental operations. They
+        # must not use identical public listing tokens, even if their URL is equal.
+        conflicts.append({'type': 'duplicate_public_listing_tokens', 'count': len(tokens)-len(set(tokens))})
     coverage = len(matched_ids) / len(legacy) if legacy else 1.0
     counts = Counter(x['operation'] for x in generated)
     report = {
         'tokko_properties': len(rows), 'legacy_catalog': len(legacy), 'candidate_rows': len(generated),
         'legacy_matched': len(matched_ids), 'legacy_coverage': round(coverage, 4),
         'unmatched_legacy': len(legacy) - len(matched_ids), 'operation_counts': dict(counts),
-        'skipped_reasons': dict(skipped), 'match_conflicts': conflicts[:25],
+        'skipped_reasons': dict(skipped), 'secondary_matches': secondary_matches, 'match_conflicts': conflicts[:25],
         'ready_for_cutover': coverage >= 0.90 and len(generated) >= max(1, (9 * len(legacy) + 9)//10) and not conflicts,
         'policy': 'STAGING ONLY. A separate approved cutover must verify token parity, QA, backup and rollback.',
     }
