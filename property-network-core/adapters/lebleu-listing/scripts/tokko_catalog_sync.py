@@ -22,6 +22,18 @@ from typing import Any
 API = 'https://www.tokkobroker.com/api/v1/property/'
 PROD_CATALOG = Path('/opt/lebleu-listing-bridge/public/data/full/catalog.json')
 ALLOWED_IMG_HOSTS = {'static.tokkobroker.com'}
+# 2026-11-17: independently verified by comparing five Tokko photos per
+# exact address/price pair (2–5 matching dHashes). Keep the historical public
+# card and all its links; suppress only the NEW duplicate feed entry.
+# If fields cease matching, block the sync and demand review.
+REVIEWED_DUPLICATE_ALIASES = {
+    'Moldes 2855 AP364747': 'Moldes 2855 AP10337355',
+    'LAP6949373': 'LAP7925869',
+    'LGA7206888': 'LGA7206907',
+    'LAP7206950': 'LGA7206976',
+    'LAP8559753': 'LAP8559856',
+}
+
 OPS = {'venta': 'Venta', 'alquiler': 'Alquiler', 'alquiler temporario': 'Alquiler temporario'}
 TYPES = {'Local': 'Local Comercial', 'Terreno o Lote': 'Terreno', 'Galpon': 'Galpón'}
 FEATURE_NAMES = {
@@ -303,6 +315,32 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
             item['sourceFingerprint'] = (legacy_item.get('sourceFingerprint') or current_source) if (same_version or first_baseline) else current_source
             item['ruContentFingerprint'] = (legacy_item.get('ruContentFingerprint') or current_ru) if (same_version or first_baseline) else current_ru
             generated.append(item)
+    suppressed_duplicates = []
+    for alias, canonical in REVIEWED_DUPLICATE_ALIASES.items():
+        from_new = [v for v in generated if v.get('code') == alias]
+        source_existing = [v for v in generated if v.get('code') == canonical]
+        if not from_new:
+            continue
+        if len(from_new) != 1 or len(source_existing) != 1:
+            conflicts.append({'code': alias, 'type': 'duplicate_alias_ambiguous_or_missing'})
+            continue
+        duplicate, retained = from_new[0], source_existing[0]
+        a = positive(duplicate.get('details', {}).get('totalAreaM2'))
+        b = positive(retained.get('details', {}).get('totalAreaM2'))
+        area_compatible = a is None or b is None or abs(a-b)/max(a,b) <= 0.10
+        same_facts = all((
+            norm(duplicate.get('address')) == norm(retained.get('address')),
+            duplicate.get('operation') == retained.get('operation'),
+            duplicate.get('propertyType') == retained.get('propertyType'),
+            duplicate.get('priceAmount') == retained.get('priceAmount'),
+            duplicate.get('priceCurrency') == retained.get('priceCurrency'),
+            area_compatible,
+        ))
+        if not same_facts:
+            conflicts.append({'code': alias, 'type': 'verified_duplicate_facts_diverged'})
+            continue
+        generated.remove(duplicate)
+        suppressed_duplicates.append({'suppressed_code': alias, 'canonical_code': canonical, 'reason': 'verified_existing_card_visual_duplicate'})
     if len({(x['sourceUrl'], x['operation']) for x in generated}) != len(generated):
         raise RuntimeError('Duplicate sourceURL+operation detected')
     tokens = [f"{x['code']}_{hashlib.sha256(x['sourceUrl'].encode()).hexdigest()[:8]}" for x in generated]
@@ -316,7 +354,8 @@ def build_candidate(rows: list[dict], legacy: list[dict]) -> tuple[list[dict], d
         'tokko_properties': len(rows), 'legacy_catalog': len(legacy), 'candidate_rows': len(generated),
         'legacy_matched': len(matched_ids), 'legacy_coverage': round(coverage, 4),
         'unmatched_legacy': len(legacy) - len(matched_ids), 'operation_counts': dict(counts),
-        'skipped_reasons': dict(skipped), 'secondary_matches': secondary_matches, 'match_conflicts': conflicts[:25],
+        'skipped_reasons': dict(skipped), 'secondary_matches': secondary_matches, 'suppressed_duplicates': suppressed_duplicates,
+        'match_conflicts': conflicts[:25],
         'ready_for_cutover': coverage >= 0.90 and len(generated) >= max(1, (9 * len(legacy) + 9)//10) and not conflicts,
         'policy': 'STAGING ONLY. A separate approved cutover must verify token parity, QA, backup and rollback.',
     }
