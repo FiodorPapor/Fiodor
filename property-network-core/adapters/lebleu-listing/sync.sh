@@ -53,6 +53,8 @@ case "$SOURCE_MODE" in
     timeout 150s python3 /opt/property-network-tokko-staging/code/tokko_catalog_sync.py \
       --legacy "$ROOT/public/data/full/catalog.json" \
       --output-dir /opt/property-network-tokko-staging/candidate
+    echo "[$(date -Is)] Tokko withdrawal verification: two healthy snapshots"
+    timeout 15s python3 /opt/property-network-tokko-staging/code/tokko_retire.py
     echo "[$(date -Is)] Tokko exact-token atomic promotion"
     timeout 20s python3 /opt/property-network-tokko-staging/code/tokko_promote.py --apply
     # No website scraping or large all-photo image hash pass in Tokko mode.
